@@ -10,11 +10,12 @@
     #include <abstractions/nameservice>
 
     # The binary itself and git-core helpers
-    /usr/bin/git                        mr,
+    /usr/bin/git                        mrix,
     /usr/lib/git-core/                  r,
-    /usr/lib/git-core/**                mr,
-    /usr/share/git-core/                r,
-    /usr/share/git-core/**              r,
+    /usr/lib/git-core/**                mrix,
+
+    # SSH commit signing - git calls ssh-keygen -Y sign
+    /usr/bin/ssh-keygen                 ix,
 
     # Git config
     @{HOME}/.gitconfig                  r,
@@ -25,7 +26,7 @@
     # Repositories --- broad read/write under home; tighten to specific repo
     # paths if you want a more restrictive profile.
     @{HOME}/                            r,
-    @{HOME}/**                          rw,
+    @{HOME}/**                          rwl,
 
     # SSH config (read-only --- git reads ~/.ssh/config for Host blocks)
     @{HOME}/.ssh/                       r,
@@ -51,6 +52,28 @@
     /usr/bin/nano                       ix,
     /usr/bin/diff                       ix,
     /usr/bin/patch                      ix,
+
+    # Temporary files - git commit always creates these
+    /tmp/                               r,
+    /tmp/**                             rwk,
+    /var/tmp/                           r,
+    /var/tmp/**                         rw,
+
+    # Shell and scripting runtimes - needed to run .git/hooks/* scripts
+    /bin/sh                             ix,
+    /usr/bin/sh                         ix,
+    /bin/bash                           ix,
+    /usr/bin/bash                       ix,
+    /usr/bin/perl                       ix,
+    /usr/bin/python3*                   ix,
+
+    # Proc — git reads /proc/self for identity and terminal info
+    @{PROC}/self/                       r,
+    @{PROC}/self/**                     r,
+
+    # Random — used during object ID generation
+    /dev/urandom                        r,
+    /dev/random                         r,
 
     # Credentials helpers
     /usr/lib/git-core/git-credential-*  ix,

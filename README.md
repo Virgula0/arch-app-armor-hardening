@@ -1,5 +1,8 @@
 # SSH-Guard: Arch Linux Supply Chain System Hardening Guide
 
+> [!NOTE]
+> WIP attempt, it may cause permission problems.
+
 Supply Chain Attacks are very annoying. This setup aims to protect at least the most sensitive key files allowing only whitelisted binaries to access those sensitive files.
 
 As shown in this example, onnly `ssh` along with `ssh-agent`and family and `git` will be allowed to access the `~/.ssh` by the user.
