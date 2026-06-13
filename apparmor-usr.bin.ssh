@@ -1,0 +1,71 @@
+# AppArmor profile for /usr/bin/ssh
+# Install to: /etc/apparmor.d/usr.bin.ssh
+# Load:       sudo apparmor_parser -r /etc/apparmor.d/usr.bin.ssh
+# Enforce:    sudo aa-enforce /usr/bin/ssh
+
+#include <tunables/global>
+
+/usr/bin/ssh {
+    #include <abstractions/base>
+    #include <abstractions/nameservice>
+    #include <abstractions/openssl>
+
+    # The binary itself
+    /usr/bin/ssh                        mr,
+
+    # Read SSH config and key material from the user's .ssh directory.
+    # The fanotify daemon provides the second layer: it enforces that only
+    # whitelisted inodes (verified at load_config() time) can open these files.
+    @{HOME}/.ssh/                       r,
+    @{HOME}/.ssh/*                      r,
+    /root/.ssh/                         r,
+    /root/.ssh/*                        r,
+
+    # Global SSH config
+    /etc/ssh/ssh_config                 r,
+    /etc/ssh/ssh_config.d/              r,
+    /etc/ssh/ssh_config.d/*             r,
+
+    # Known hosts (read and write --- ssh updates it on new host key acceptance)
+    @{HOME}/.ssh/known_hosts            rw,
+    @{HOME}/.ssh/known_hosts.old        rw,
+    /etc/ssh/ssh_known_hosts            r,
+    /etc/ssh/ssh_known_hosts2           r,
+
+    # Control socket (ControlMaster / ControlPath)
+    @{HOME}/.ssh/control/               rw,
+    @{HOME}/.ssh/control/*              rw,
+    /tmp/ssh-*/                         rw,
+    /tmp/ssh-*/**                       rw,
+
+    # SSH agent socket (unix abstract namespace)
+    unix (connect, send, receive) type=stream,
+
+    # Networking
+    network inet  stream,
+    network inet6 stream,
+    network inet  dgram,
+    network inet6 dgram,
+
+    # Allow ssh to spawn askpass helpers and proxies
+    /usr/lib/openssh/ssh_askpass*       ix,
+    /usr/lib/openssh/ssh-pkcs11-helper  ix,
+    /usr/lib/openssh/ssh-sk-helper      ix,
+
+    # Subprocess pipes (ControlMaster, ProxyCommand, etc.)
+    /usr/bin/nc                         ix,
+    /usr/bin/socat                      ix,
+
+    # Proc entries we need
+    @{PROC}/self/fd/                    r,
+    @{PROC}/@{pid}/fd/                  r,
+
+    # Terminals
+    /dev/tty                            rw,
+    /dev/pts/*                          rw,
+
+    # Deny writes to .ssh key files (no legitimate reason for ssh to write keys)
+    deny @{HOME}/.ssh/id_*             w,
+    deny @{HOME}/.ssh/*.pem            w,
+}
+

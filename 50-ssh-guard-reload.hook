@@ -1,0 +1,23 @@
+# /etc/pacman.d/hooks/50-ssh-guard-reload.hook
+#
+# After pacman installs or upgrades any package that replaces a whitelisted
+# binary, send SIGHUP to ssh-guard so it re-reads the new inodes.
+#
+# Without this, the daemon keeps the old inodes in memory and the newly
+# installed binaries get denied until the daemon is manually reloaded.
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+
+# Extend this list if you add more binaries to [allow] in ssh-guard.conf
+Target = openssh
+Target = git
+Target = git-core
+Target = libgit2
+
+[Action]
+Description = Refreshing ssh-guard inode whitelist
+When = PostTransaction
+Exec = /usr/bin/systemctl kill -s HUP ssh-guard.service

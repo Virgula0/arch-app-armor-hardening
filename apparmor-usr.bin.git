@@ -1,0 +1,67 @@
+# AppArmor profile for /usr/bin/git
+# Install to: /etc/apparmor.d/usr.bin.git
+# Load:       sudo apparmor_parser -r /etc/apparmor.d/usr.bin.git
+# Enforce:    sudo aa-enforce /usr/bin/git
+
+#include <tunables/global>
+
+/usr/bin/git {
+    #include <abstractions/base>
+    #include <abstractions/nameservice>
+
+    # The binary itself and git-core helpers
+    /usr/bin/git                        mr,
+    /usr/lib/git-core/                  r,
+    /usr/lib/git-core/**                mr,
+    /usr/share/git-core/                r,
+    /usr/share/git-core/**              r,
+
+    # Git config
+    @{HOME}/.gitconfig                  r,
+    @{HOME}/.config/git/                r,
+    @{HOME}/.config/git/**              r,
+    /etc/gitconfig                      r,
+
+    # Repositories --- broad read/write under home; tighten to specific repo
+    # paths if you want a more restrictive profile.
+    @{HOME}/                            r,
+    @{HOME}/**                          rw,
+
+    # SSH config (read-only --- git reads ~/.ssh/config for Host blocks)
+    @{HOME}/.ssh/                       r,
+    @{HOME}/.ssh/config                 r,
+    @{HOME}/.ssh/known_hosts            r,
+
+    # Explicitly deny reading private keys --- only the ssh subprocess needs them.
+    # The fanotify guard enforces this at the inode level; this is a second layer.
+    deny @{HOME}/.ssh/id_*             rw,
+    deny @{HOME}/.ssh/*.pem            rw,
+    deny @{HOME}/.ssh/*.key            rw,
+
+    # Spawn ssh for remote operations (ix = inherit profile, Px = use ssh's own profile)
+    # Using Px ensures git's spawned ssh runs under the ssh AppArmor profile.
+    /usr/bin/ssh                        Px,
+    /usr/bin/scp                        Px,
+    /usr/bin/sftp                       Px,
+    /usr/bin/gpg                        ix,
+
+    # Pagers and editors (git log, git commit, etc.)
+    /usr/bin/less                       ix,
+    /usr/bin/vim                        ix,
+    /usr/bin/nano                       ix,
+    /usr/bin/diff                       ix,
+    /usr/bin/patch                      ix,
+
+    # Credentials helpers
+    /usr/lib/git-core/git-credential-*  ix,
+    @{HOME}/.git-credentials            rw,
+
+    # Terminals and pipes
+    /dev/tty                            rw,
+    /dev/pts/*                          rw,
+    /dev/null                           rw,
+
+    # Proc
+    @{PROC}/self/fd/                    r,
+}
+
