@@ -5,12 +5,12 @@
 
 Supply Chain Attacks are very annoying. This setup aims to protect at least the most sensitive key files allowing only whitelisted binaries to access those sensitive files.
 
-As shown in this example, onnly `ssh` along with `ssh-agent`and family and `git` will be allowed to access the `~/.ssh` by the user.
+As shown in this example, only `ssh` along with `ssh-agent`and family and `git` will be allowed to access the `~/.ssh` by the user.
 
 Update directories and files to protect them accordingly. Do not rely on recursiveness. Add one directory at a time to protect in configs.
 
 > [!WARNING]
-> Arch's default linux kernel ships with AppArmor, Landlock, eBPF/LSM, IMA, and fanotify all enabled. SELinux requires the linux-hardened package instead. This setup should work also on other Linux distros but some additional packages and system configuration may be needed to change.
+> Arch's default linux kernel ships with AppArmor and fanotify all enabled. SELinux requires the linux-hardened package instead. This setup should work also on other Linux distros but some additional packages and system configuration may be needed to change.
 
 > [!WARNING]
 > This procedure tries to protect sensitive directories running with normal user privileges.
@@ -19,6 +19,18 @@ Update directories and files to protect them accordingly. Do not rely on recursi
 # High-level description
 
 ![Overview](./images/arch_linux_security_stack.svg)
+
+graph TD
+    A[git / ssh] -->|Initiates Request| B[AppArmor profile]
+    subgraph "Execution Context"
+        B -->|Checks Permissions| C{What binary is allowed to access?}
+        C -->|Validates Paths/Caps/Network| D[fanotify daemon]
+    end
+    D -->|Inode-verified whitelist| E[~/.ssh protected]
+
+    style B fill:#f9f,stroke:#333,stroke-width:2px
+    style D fill:#bbf,stroke:#333,stroke-width:2px
+    style E fill:#dfd,stroke:#333,stroke-width:2px
 
 # Setup
 
