@@ -134,7 +134,7 @@ Jun 13 18:06:46 red-fox-19291 ssh-guard[1145975]: DENIED access tracking -> pid=
 > [!WARNING]
 > If you need to disable the guard for some reason and access `~/.git` you can kill the process temporarly by doing
 > `sudo pkill ssh-guard`
-> It will back by rebooting or `sudo systemctl start ssh-guard`.
+> It will be back up and running by rebooting or with `sudo systemctl start ssh-guard`.
 
 5. Step 5 --- Pacman hook (critical for updates)
 
