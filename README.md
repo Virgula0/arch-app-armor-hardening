@@ -20,18 +20,6 @@ Update directories and files to protect them accordingly. Do not rely on recursi
 
 ![Overview](./images/arch_linux_security_stack.svg)
 
-graph TD
-    A[git / ssh] -->|Initiates Request| B[AppArmor profile]
-    subgraph "Execution Context"
-        B -->|Checks Permissions| C{What binary is allowed to access?}
-        C -->|Validates Paths/Caps/Network| D[fanotify daemon]
-    end
-    D -->|Inode-verified whitelist| E[~/.ssh protected]
-
-    style B fill:#f9f,stroke:#333,stroke-width:2px
-    style D fill:#bbf,stroke:#333,stroke-width:2px
-    style E fill:#dfd,stroke:#333,stroke-width:2px
-
 # Setup
 
 1. AppArmor (enable at boot)
