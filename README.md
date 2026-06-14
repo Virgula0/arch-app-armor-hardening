@@ -12,9 +12,9 @@ Update directories and files to protect them accordingly. Do not rely on recursi
 > [!WARNING]
 > Arch's default linux kernel ships with AppArmor and fanotify all enabled. SELinux requires the linux-hardened package instead. This setup should work also on other Linux distros but some additional packages and system configuration may be needed to change.
 
-> [!WARNING]
+> [!TIP]
 > This procedure tries to protect sensitive directories running with normal user privileges.
-> If you run everything as root (and you definitely shouldn't), this setup is completely useless.
+> `AppArmor` can protect such targets even if a malware runs under root privileges (theoretically)
 
 # High-level description
 
