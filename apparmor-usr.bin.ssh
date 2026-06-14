@@ -10,23 +10,33 @@
     #include <abstractions/nameservice>
     #include <abstractions/openssl>
 
+    set rlimit core <= 0,
+    deny ptrace,
+    deny capability sys_ptrace,
+    deny @{HOME}/** mx,
+    deny /tmp/** mx,
+    deny /var/tmp/** mx,
+    deny /dev/shm/** mx,
+    deny /run/user/[0-9]*/** mx,
+
     # The binary itself
     /usr/bin/ssh                        mr,
+    /usr/bin/ssh-keygen                 mr,
 
     # Read SSH config and key material from the user's .ssh directory.
-    # The fanotify daemon provides the second layer: it enforces that only
-    # whitelisted inodes (verified at load_config() time) can open these files.
+    # Read-only, any filename. The fanotify daemon (ssh-guard) is the
+    # second layer: only this binary's inode is on its whitelist.
     @{HOME}/.ssh/                       r,
-    @{HOME}/.ssh/*                      r,
+    @{HOME}/.ssh/* r,
     /root/.ssh/                         r,
-    /root/.ssh/*                        r,
+    /root/.ssh/* r,
 
     # Global SSH config
     /etc/ssh/ssh_config                 r,
     /etc/ssh/ssh_config.d/              r,
-    /etc/ssh/ssh_config.d/*             r,
+    /etc/ssh/ssh_config.d/* r,
 
-    # Known hosts (read and write --- ssh updates it on new host key acceptance)
+    # Known hosts (read and write -- ssh updates it on new host key acceptance)
     @{HOME}/.ssh/known_hosts            rw,
     @{HOME}/.ssh/known_hosts.old        rw,
     /etc/ssh/ssh_known_hosts            r,
@@ -34,9 +44,12 @@
 
     # Control socket (ControlMaster / ControlPath)
     @{HOME}/.ssh/control/               rw,
-    @{HOME}/.ssh/control/*              rw,
+    @{HOME}/.ssh/control/* rw,
     /tmp/ssh-*/                         rw,
-    /tmp/ssh-*/**                       rw,
+    /tmp/ssh-*/** rw,
+
+    # Allow git to use ssh-keygen for commit signing
+    /tmp/.git_signing_buffer_* rw,
 
     # SSH agent socket (unix abstract namespace)
     unix (connect, send, receive) type=stream,
@@ -48,7 +61,7 @@
     network inet6 dgram,
 
     # Allow ssh to spawn askpass helpers and proxies
-    /usr/lib/openssh/ssh_askpass*       ix,
+    /usr/lib/openssh/ssh_askpass* ix,
     /usr/lib/openssh/ssh-pkcs11-helper  ix,
     /usr/lib/openssh/ssh-sk-helper      ix,
 
@@ -62,10 +75,5 @@
 
     # Terminals
     /dev/tty                            rw,
-    /dev/pts/*                          rw,
-
-    # Deny writes to .ssh key files (no legitimate reason for ssh to write keys)
-    deny @{HOME}/.ssh/id_*             w,
-    deny @{HOME}/.ssh/*.pem            w,
+    /dev/pts/* rw,
 }
-

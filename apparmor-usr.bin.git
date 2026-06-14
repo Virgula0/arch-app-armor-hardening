@@ -9,42 +9,45 @@
     #include <abstractions/base>
     #include <abstractions/nameservice>
 
+    # Explicit terminfo paths (replacing the missing abstractions/ncurses)
+    /etc/terminfo/** r,
+    /lib/terminfo/** r,
+    /usr/share/terminfo/** r,
+    @{HOME}/.terminfo/** r,
+
     # The binary itself and git-core helpers
     /usr/bin/git                        mrix,
     /usr/lib/git-core/                  r,
-    /usr/lib/git-core/**                mrix,
+    /usr/lib/git-core/** mrix,
 
-    # SSH commit signing - git calls ssh-keygen -Y sign
-    /usr/bin/ssh-keygen                 ix,
+    # SSH commit signing -- git calls ssh-keygen -Y sign
+    /usr/bin/ssh-keygen                 px -> /usr/bin/ssh,
 
     # Git config
     @{HOME}/.gitconfig                  r,
     @{HOME}/.config/git/                r,
-    @{HOME}/.config/git/**              r,
+    @{HOME}/.config/git/** r,
     /etc/gitconfig                      r,
 
-    # Repositories --- broad read/write under home; tighten to specific repo
+    # Repositories -- broad read/write under home; tighten to specific repo
     # paths if you want a more restrictive profile.
     @{HOME}/                            r,
-    @{HOME}/**                          rwl,
+    @{HOME}/** rwl,
 
-    # SSH config (read-only --- git reads ~/.ssh/config for Host blocks)
-    @{HOME}/.ssh/                       r,
-    @{HOME}/.ssh/config                 r,
-    @{HOME}/.ssh/known_hosts            r,
+    # ----------------------------------------------------------------------
+    # ~/.ssh -- TOTAL DENIAL, independent of file names
+    # ----------------------------------------------------------------------
+    deny @{HOME}/.ssh/** rwklmx,
+    deny /root/.ssh/** rwklmx,
 
-    # Explicitly deny reading private keys --- only the ssh subprocess needs them.
-    # The fanotify guard enforces this at the inode level; this is a second layer.
-    deny @{HOME}/.ssh/id_*             rw,
-    deny @{HOME}/.ssh/*.pem            rw,
-    deny @{HOME}/.ssh/*.key            rw,
-
-    # Spawn ssh for remote operations (ix = inherit profile, Px = use ssh's own profile)
-    # Using Px ensures git's spawned ssh runs under the ssh AppArmor profile.
+    # Spawn ssh for remote operations.
+    # Px = run under ssh's own profile (the only profile permitted to
+    # touch ~/.ssh). Do NOT change these to ix.
     /usr/bin/ssh                        Px,
     /usr/bin/scp                        Px,
     /usr/bin/sftp                       Px,
-    /usr/bin/gpg                        ix,
+    /usr/bin/gpg                        PUx,
+    /usr/bin/gpg2                       PUx,
 
     # Pagers and editors (git log, git commit, etc.)
     /usr/bin/less                       ix,
@@ -53,38 +56,35 @@
     /usr/bin/diff                       ix,
     /usr/bin/patch                      ix,
 
-    # Temporary files - git commit always creates these
-    /tmp/                               r,
-    /tmp/**                             rwk,
+    # Temporary files -- git commit always creates these
+    /tmp/                               rw,
+    /tmp/** rwk,
     /var/tmp/                           r,
-    /var/tmp/**                         rw,
+    /var/tmp/** rw,
 
-    # Shell and scripting runtimes - needed to run .git/hooks/* scripts
+    # Shell and scripting runtimes -- needed to run .git/hooks/* scripts
     /bin/sh                             ix,
     /usr/bin/sh                         ix,
     /bin/bash                           ix,
     /usr/bin/bash                       ix,
     /usr/bin/perl                       ix,
-    /usr/bin/python3*                   ix,
+    /usr/bin/python3* ix,
 
-    # Proc — git reads /proc/self for identity and terminal info
+    # Proc -- git reads /proc/self for identity and terminal info
     @{PROC}/self/                       r,
-    @{PROC}/self/**                     r,
+    @{PROC}/self/** r,
+    @{PROC}/self/fd/                    r,
 
-    # Random — used during object ID generation
+    # Random -- used during object ID generation
     /dev/urandom                        r,
     /dev/random                         r,
 
     # Credentials helpers
-    /usr/lib/git-core/git-credential-*  ix,
+    /usr/lib/git-core/git-credential-* ix,
     @{HOME}/.git-credentials            rw,
 
     # Terminals and pipes
     /dev/tty                            rw,
-    /dev/pts/*                          rw,
+    /dev/pts/* rw,
     /dev/null                           rw,
-
-    # Proc
-    @{PROC}/self/fd/                    r,
 }
-

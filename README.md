@@ -21,18 +21,18 @@ Update directories and files to protect them accordingly. Do not rely on recursi
 ![Overview](./images/arch_linux_security_stack.svg)
 
 To achieve the goal, we will enforce some rules using `MAC` (Mandatory Access Control) rules using AppArmor.
-By default, Linux for user role permission management uses the `DAC` (Discretionary Access Control), which allows the transfer of user permission to other users via the usual `Owner-Group-Other` policy management. 
+By default, Linux for user role permission management uses the `DAC` (Discretionary Access Control), which allows the transfer of user permission to other users via the usual `Owner-Group-Other` policy management.
 
-It is very handy but unsafe sometimes. 
+It is very handy but unsafe sometimes.
 
 On the other hand, `MAC` policies define static rules and tag labels where processes, users and objects must adhere in order to access other processes, users, and objects. Applying a whole `MAC` to the entire Linux filesystem could be a pain to handle, but targeting only some sensitive files that rarely should be accessible by the user themselves can be a great improvement from a security point of view. Also, if you use `SELinux`, you probably don't even need `apparmor` because, as far as I know, you should be able to obtain a similar behaviour on the permissions of files via `ACL` (Access Control List) management rather than traditional `DAC`, by using the built-in available commands `setfacl` and `getfacl`.
 
 As shwon in the image:
 
-- The `MAC` policy allow **WHAT the binary (`git` and `ssh` here) is allowed to access (paths, caps, network)**
+- The `MAC` policy allow **WHAT the binary (`ssh` here) is allowed to access (paths, caps, network)**
 - The fanotify daemon allows to check **WHO is allowed to access ~/.ssh**
 
-You can get inspiration from this basic guide, add to the setup your own directories which contain `tokens`, `keys`, and other sensitive data but remember that if the whitelisted application allow to read them, this can become useless as such binaries can be used to bypass restrictions and read the content of the files. For example you should not whitelist application which allow to execute commands or contain built-in self readers such like `more`, `less`, `cat` and so on. 
+You can get inspiration from this basic guide, add to the setup your own directories which contain `tokens`, `keys`, and other sensitive data but remember that if the whitelisted application allow to read them, this can become useless as such binaries can be used to bypass restrictions and read the content of the files. For example you should not whitelist application which allow to execute commands or contain built-in self readers such like `more`, `less`, `cat` and so on.
 
 This underlines why the `AppArmor` profiles alone are not enough.
 In fact assuming to rely entirely on `AppArmor` profiles we could have a situation like this:
@@ -74,7 +74,7 @@ sudo systemctl enable --now apparmor
 aa-status   # should show "apparmor module is loaded"
 ```
 
-> [!IMPORTANT]  
+> [!IMPORTANT]
 > If you meet the message `apparmor filesystem is not mounted.` by running `aa-status`, you probably installed `arch linux` using `archinstall >= 2.7`. `Archinstall 2.7` added Unified Kernel Image support (https://www.phoronix.com/news/Arch-Linux-Archinstall-2.7) so updating the `GRUB_CMDLINE_LINUX` is not enough. You can find the fix in the document [UKI-BASED-INSTALLS.md](./uki-based-installs.md)
 
 
@@ -92,7 +92,7 @@ sudo aa-complain /usr/bin/ssh /usr/bin/git
 
 > [!IMPORTANT]
 > You need to record your activities on the target binaries for a week (or more if you want).
-> 
+>
 > Why this is important? Jumping straight to enforce mode risks silently or loudly breaking your git/ssh workflows the moment the profile encounters something I didn't anticipate -- and hand-written profiles (even careful ones) almost always have gaps, because what a binary actually touches depends heavily on your specific usage patterns, not just the binary's source code. The "trial period" ensures to capture missing behaviours from the profile. This adapts your custom usages/configurations on top of mine.
 
 Optionally check logs before enforcing:
@@ -145,7 +145,7 @@ sudo /usr/local/sbin/ssh-guard
 
 # In another terminal --- this should work:
 ssh-add -l
-git status
+ssh -T git@github.com
 
 # This should be DENIED (not in whitelist):
 sudo -u ${USER} $ cat /home/alice/.ssh/id_ed25519   # denied if cat not in allow list
@@ -177,7 +177,7 @@ Jun 13 18:06:46 red-fox-19291 ssh-guard[1145975]: DENIED access tracking -> pid=
 
 > [!WARNING]
 > If you need to disable the guard for some reason and access `~/.git` normally from the user you can stop the process temporarly by doing `sudo systemctl stop ssh-guard`
-> 
+>
 > It will be back up and running by rebooting or with `sudo systemctl start ssh-guard`.
 
 ## 5. Step 5: Pacman hook (critical for updates)
@@ -195,6 +195,52 @@ You can also reload at any time yourself:
 sudo systemctl kill -s HUP ssh-guard
 # or: sudo kill -HUP $(cat /run/ssh-guard.pid)
 ```
+
+## 6. Optional Topic - SSH-Agent `troubleshooting`
+
+As long as you have a setup which works at system startup to load SSH keys from `~/.ssh`. The setup should already work.
+In case you have problems like `ssh-add -l` hanging or something like this, you can follow this simple setup like mine to set up `ssh-agent`. Be sure to delete any other `ssh-agent` setups before proceeding.
+
+More info: https://wiki.archlinux.org/title/SSH_keys#Start_ssh-agent_with_systemd_user
+
+```bash
+mkdir -p ~/.config/systemd/user
+systemctl --user daemon-reload
+systemctl --user enable ssh-agent.service
+systemctl --user start ssh-agent.service
+systemctl --user status ssh-agent.service
+
+# eventually inspect the logs
+
+journalctl --user -u ssh-agent.service -b -f
+
+# if you use bash update .bash_profile
+echo 'export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR}/ssh-agent.socket"' >> ~/.bash_profile
+
+# if you use zsh
+echo 'export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR}/ssh-agent.socket"' >> ~/.zshrc
+```
+
+At this point you could even notice:
+
+```bash
+ssh-add -l
+
+No identities loaded from the profile
+```
+
+This is because a missing or not well-configured config under `~/.ssh/config` is present.
+Create it with something like this.
+
+```bash
+Host *
+    AddKeysToAgent yes          # add key to agent on first use
+    IdentityFile ~/.ssh/github.key
+    ServerAliveInterval 60      # keep connections alive
+    ServerAliveCountMax 3
+```
+
+At this point, `ssh -T git@github.com` should work and `ssh-add -l` should show your loaded key/s.
 
 ### Notes
 
