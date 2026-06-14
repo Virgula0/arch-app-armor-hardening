@@ -41,6 +41,10 @@ sudo systemctl enable --now apparmor
 aa-status   # should show "apparmor module is loaded"
 ```
 
+> [!IMPORTANT]  
+> If you steel meet the message re-running `aa-status`, you probably installed `arch linux` using `archinstall >= 2.7`. `Archinstall 2.7` added Unified Kernel Image support (https://www.phoronix.com/news/Arch-Linux-Archinstall-2.7) so updating the `GRUB_CMDLINE_LINUX` is not enough. You can find the fix in the document [UKI-Based](./uki-based-installs.md)
+
+
 2. Install AppArmor profiles
 
 ```bash
@@ -54,7 +58,9 @@ sudo aa-complain /usr/bin/ssh /usr/bin/git
 ```
 
 > [!IMPORTANT]
-> You need to record your activities on the target directories for a week (or more if you want)
+> You need to record your activities on the target binaries for a week (or more if you want).
+> 
+> Why this is important? Jumping straight to enforce mode risks silently or loudly breaking your git/ssh workflows the moment the profile encounters something the author didn't anticipate — and hand-written profiles (even careful ones) almost always have gaps, because what a binary actually touches depends heavily on your specific usage patterns, not just the binary's source code. The "trial period" ensures to capture missing behaviours from the profile. This adapts your custom usages/configurations on top of mine.
 
 ```bash
 # After a week of clean logs, enforce:
@@ -62,7 +68,6 @@ sudo aa-complain /usr/bin/ssh /usr/bin/git
 ```
 
 Optionally check logs before enforcing:
-
 
 ```bash
 sudo aa-logprof   # interactive: review and tune before enforcing
@@ -73,14 +78,16 @@ journalctl -f | grep -i apparmor
 
 ```bash
 sudo pacman -S --needed gcc
-sudo gcc -O2 -Wall -Wextra -o /usr/local/sbin/ssh-guard scripts/ssh-guard.c
+sudo gcc -O2 -Wall -Wextra -o /usr/local/sbin/ssh-guard scripts/ssh-guard-c/ssh-guard.c
 
-# OR compile the go-version
-cd scripts
+# OR compile the go-version, you need go installed at least 1.26
+# this conversion has been done because i did not checked carefully the c script, and the c-version if contains memory corruption vulnerabilities can be exploited for privilege escalation tenchiques
+# use a memory-safe language should prevent this
+
+cd scripts/ssh-guard-go
 go mod download && go mod verify && go mod tidy
-cd scripts
 sudo go build -ldflags="-s -w" -o /usr/local/sbin/ssh-guard ssh-guard.go
-cd ..
+cd ../../
 
 sudo chmod 700 /usr/local/sbin/ssh-guard
 ```
