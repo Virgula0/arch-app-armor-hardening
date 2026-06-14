@@ -205,6 +205,7 @@ More info: https://wiki.archlinux.org/title/SSH_keys#Start_ssh-agent_with_system
 
 ```bash
 mkdir -p ~/.config/systemd/user
+cp ssh-agent.service ~/.config/systemd/user/.
 systemctl --user daemon-reload
 systemctl --user enable ssh-agent.service
 systemctl --user start ssh-agent.service
