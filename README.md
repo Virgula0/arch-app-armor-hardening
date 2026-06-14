@@ -1,7 +1,7 @@
 # SSH-Guard: Arch Linux Supply Chain System Hardening Guide
 
 > [!NOTE]
-> WIP attempt, it may cause permission problems.
+> WIP attempt, be careful.
 
 Supply Chain Attacks are very annoying. This setup aims to protect at least the most sensitive key files allowing only whitelisted binaries to access those sensitive files.
 
@@ -20,9 +20,42 @@ Update directories and files to protect them accordingly. Do not rely on recursi
 
 ![Overview](./images/arch_linux_security_stack.svg)
 
+To achieve the goal, we will enforce some rules using `MAC` (Mandatory Access Control) rules using AppArmor.
+By default, Linux for user role permission management uses the `DAC` (Discretionary Access Control), which allows the transfer of user permission to other users via the usual `Owner-Group-Other` policy management. 
+
+It is very handy but unsafe sometimes. 
+
+On the other hand, `MAC` policies define static rules and tag labels where processes, users and objects must adhere in order to access other processes, users, and objects. Applying a whole `MAC` to the entire Linux filesystem could be a pain to handle, but targeting only some sensitive files that rarely should be accessible by the user themselves can be a great improvement from a security point of view. Also, if you use `SELinux`, you probably don't even need `apparmor` because, as far as I know, you should be able to obtain a similar behaviour on the permissions of files via `ACL` (Access Control List) management rather than traditional `DAC`, by using the built-in available commands `setfacl` and `getfacl`.
+
+As shwon in the image:
+
+- The `MAC` policy allow **WHAT the binary (`git` and `ssh` here) is allowed to access (paths, caps, network)**
+- The fanotify daemon allows to check **WHO is allowed to access ~/.ssh**
+
+You can get inspiration from this basic guide, add to the setup your own directories which contain `tokens`, `keys`, and other sensitive data but remember that if the whitelisted application allow to read them, this can become useless as such binaries can be used to bypass restrictions and read the content of the files. For example you should not whitelist application which allow to execute commands or contain built-in self readers such like `more`, `less`, `cat` and so on. 
+
+This underlines why the `AppArmor` profiles alone are not enough.
+In fact assuming to rely entirely on `AppArmor` profiles we could have a situation like this:
+
+The `systemctl` is whitelisted and it can be used to read a file and then it can be used by the user normally for bypassing `MAC`rules usin ghe pager:
+
+```bash
+systemctl
+
+# prompt:
+#! /bin/usr/nvim /path/of/protected/file
+
+# or
+# :r ~/.ssh/id_ed25519
+```
+
+![pager_escape_two_layer_check.svg](./images/pager_escape_two_layer_check.svg)
+
+The purpose of fanotify layer is for reducing the possibility of `pager shell-escape` like the situation described above. It independently checks `/proc/<PID>/exe` of the process that issued the open(). When `less/nvim` shell-escapes to cat, that cat process has `/proc/PID/exe` -> `/usr/bin/cat`. Unless cat is also in `ssh-guard.conf` [allow], fanotify denies the open with `EPERM` -- regardless of what AppArmor permitted upstream.
+
 # Setup
 
-1. AppArmor (enable at boot)
+## 1. AppArmor (enable at boot)
 
 ```bash
 sudo pacman -S apparmor
@@ -42,10 +75,10 @@ aa-status   # should show "apparmor module is loaded"
 ```
 
 > [!IMPORTANT]  
-> If you steel meet the message re-running `aa-status`, you probably installed `arch linux` using `archinstall >= 2.7`. `Archinstall 2.7` added Unified Kernel Image support (https://www.phoronix.com/news/Arch-Linux-Archinstall-2.7) so updating the `GRUB_CMDLINE_LINUX` is not enough. You can find the fix in the document [UKI-Based](./uki-based-installs.md)
+> If you meet the message `apparmor filesystem is not mounted.` by running `aa-status`, you probably installed `arch linux` using `archinstall >= 2.7`. `Archinstall 2.7` added Unified Kernel Image support (https://www.phoronix.com/news/Arch-Linux-Archinstall-2.7) so updating the `GRUB_CMDLINE_LINUX` is not enough. You can find the fix in the document [UKI-BASED-INSTALLS.md](./uki-based-installs.md)
 
 
-2. Install AppArmor profiles
+## 2. Install AppArmor profiles
 
 ```bash
 sudo cp apparmor-usr.bin.ssh /etc/apparmor.d/usr.bin.ssh
@@ -60,21 +93,25 @@ sudo aa-complain /usr/bin/ssh /usr/bin/git
 > [!IMPORTANT]
 > You need to record your activities on the target binaries for a week (or more if you want).
 > 
-> Why this is important? Jumping straight to enforce mode risks silently or loudly breaking your git/ssh workflows the moment the profile encounters something the author didn't anticipate — and hand-written profiles (even careful ones) almost always have gaps, because what a binary actually touches depends heavily on your specific usage patterns, not just the binary's source code. The "trial period" ensures to capture missing behaviours from the profile. This adapts your custom usages/configurations on top of mine.
-
-```bash
-# After a week of clean logs, enforce:
-# sudo aa-enforce /usr/bin/ssh /usr/bin/git
-```
+> Why this is important? Jumping straight to enforce mode risks silently or loudly breaking your git/ssh workflows the moment the profile encounters something I didn't anticipate -- and hand-written profiles (even careful ones) almost always have gaps, because what a binary actually touches depends heavily on your specific usage patterns, not just the binary's source code. The "trial period" ensures to capture missing behaviours from the profile. This adapts your custom usages/configurations on top of mine.
 
 Optionally check logs before enforcing:
 
 ```bash
+sudo pamcan -S audit
+sudo systemctl enable --now auditd
 sudo aa-logprof   # interactive: review and tune before enforcing
 journalctl -f | grep -i apparmor
 ```
 
-3. Build and install the fanotify daemon
+Enforce:
+
+```bash
+# After a week of clean logs, enforce:
+sudo aa-enforce /usr/bin/ssh /usr/bin/git
+```
+
+## 3. Build and install the fanotify daemon
 
 ```bash
 sudo pacman -S --needed gcc
@@ -116,14 +153,14 @@ sudo -u ${USER} $ cat /home/alice/.ssh/id_ed25519   # denied if cat not in allow
 
 If you get blocked trying to read a key in `~/ssh` but `ssh-add -l` gave no problem you can proceed with next step.
 
-4. Install as a systemd service
+## 4. Install as a systemd service
 
 ```bash
 sudo cp ssh-guard.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ssh-guard
 
-first running check:
+# first running check:
 ps aux | grep -i ssh-guard
 
 # Live log:
@@ -139,11 +176,11 @@ Jun 13 18:06:46 red-fox-19291 ssh-guard[1145975]: DENIED access tracking -> pid=
 ```
 
 > [!WARNING]
-> If you need to disable the guard for some reason and access `~/.git` you can kill the process temporarly by doing
-> `sudo pkill ssh-guard`
+> If you need to disable the guard for some reason and access `~/.git` normally from the user you can stop the process temporarly by doing `sudo systemctl stop ssh-guard`
+> 
 > It will be back up and running by rebooting or with `sudo systemctl start ssh-guard`.
 
-5. Step 5 --- Pacman hook (critical for updates)
+## 5. Step 5: Pacman hook (critical for updates)
 
 ```bash
 sudo mkdir -p /etc/pacman.d/hooks
@@ -158,14 +195,6 @@ You can also reload at any time yourself:
 sudo systemctl kill -s HUP ssh-guard
 # or: sudo kill -HUP $(cat /run/ssh-guard.pid)
 ```
-
-### Ssh-guard.c notes
-
-The identity check in `is_allowed`() uses open("/proc/PID/exe", O_PATH) followed by `fstat()` on that file descriptor rather than readlink + stat. The `O_PATH` flag is important: it opens a reference to the kernel's dentry for the binary without reading or executing anything, and the kernel holds that reference across the `fstat()` call. This makes it TOCTOU-resistant --- if an attacker races to replace the binary between the readlink and the stat, we still get the inode of what the kernel believes is running, not what's on disk at that moment.
-
-On `SIGHUP`, the daemon calls `fanotify_mark(fd, FAN_MARK_FLUSH, ...)` which atomically removes all inode marks, then re-adds them after re-reading the config. Pending permission events already in the kernel queue are answered with the old whitelist before the flush, so there's no window where legitimate access is dropped mid-operation.
-
-The `FAN_EVENT_ON_CHILD` flag on the directory mark is what generates events for files inside `~/.ssh` --- without it, only the directory inode itself would be covered. Since `~/.ssh` is typically flat (no subdirs), this covers all key files and config.
 
 ### Notes
 
