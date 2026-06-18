@@ -126,7 +126,7 @@ Edit the config and replace `alice` with your username
 
 ```bash
 sudo mkdir -p /etc/ssh-guard
-sudo cp ssh-guard.conf /etc/ssh-guard/config
+sudo cp scripts/ssh-guard.conf /etc/ssh-guard/config
 sudo chmod 600 /etc/ssh-guard/config
 sudo nano /etc/ssh-guard/config
 ```
