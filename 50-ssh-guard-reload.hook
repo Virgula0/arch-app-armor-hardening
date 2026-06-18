@@ -12,10 +12,12 @@ Operation = Upgrade
 Type = Package
 
 # Extend this list if you add more binaries to [allow] in ssh-guard.conf
+
+# ssh utilities
 Target = openssh
-Target = git
-Target = git-core
-Target = libgit2
+
+# nmcli
+Target = networkmanager
 
 [Action]
 Description = Refreshing ssh-guard inode whitelist

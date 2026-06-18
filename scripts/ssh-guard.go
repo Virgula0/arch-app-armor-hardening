@@ -7,6 +7,7 @@ import (
 	"log/syslog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,14 +31,18 @@ type Entry struct {
 	Path string
 }
 
+type WatchEntry struct {
+	Entry
+	AllowedBins []Entry
+}
+
 // === Global Context (Protected by RWMutex) ===
 
 type SecurityContext struct {
 	sync.RWMutex
-	watchDirs   []Entry
-	allowedBins []Entry
-	syslogW     *syslog.Writer
-	isTerminal  bool
+	watchEntries []WatchEntry
+	syslogW      *syslog.Writer
+	isTerminal   bool
 }
 
 var ctx = &SecurityContext{}
@@ -74,19 +79,18 @@ func checkTerminal() bool {
 
 // === Configuration Parser ===
 
-// loadConfig reads the config path, parsing sections for watched dirs and allowed execution targets
-func loadConfig() ([]Entry, []Entry, error) {
+// loadConfig reads the config path, parsing [watch <dir>] sections each with their own allowed binary list
+func loadConfig() ([]WatchEntry, error) {
 	file, err := os.Open(ConfigPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer file.Close()
 
-	var watches []Entry
-	var allows []Entry
+	var watches []WatchEntry
+	currentIdx := -1
 
 	scanner := bufio.NewScanner(file)
-	section := 0 // 0=none, 1=[watch], 2=[allow]
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -95,15 +99,26 @@ func loadConfig() ([]Entry, []Entry, error) {
 			continue
 		}
 
-		if line == "[watch]" {
-			section = 1
+		if strings.HasPrefix(line, "[watch ") && strings.HasSuffix(line, "]") {
+			dirPath := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))
+
+			// Retrieve device identity metadata via system Stat
+			var st unix.Stat_t
+			if err := unix.Stat(dirPath, &st); err != nil {
+				logMsg(syslog.LOG_WARNING, "Skipping missing or unreadable path: %s", dirPath)
+				currentIdx = -1
+				continue
+			}
+
+			watches = append(watches, WatchEntry{
+				Entry: Entry{Dev: st.Dev, Ino: st.Ino, Path: dirPath},
+			})
+			currentIdx = len(watches) - 1
+			logMsg(syslog.LOG_INFO, "Watch Target Registered: %s (ino=%d)", dirPath, st.Ino)
 			continue
 		}
-		if line == "[allow]" {
-			section = 2
-			continue
-		}
-		if section == 0 {
+
+		if currentIdx < 0 {
 			continue
 		}
 
@@ -114,40 +129,53 @@ func loadConfig() ([]Entry, []Entry, error) {
 			continue
 		}
 
-		entry := Entry{
+		watches[currentIdx].AllowedBins = append(watches[currentIdx].AllowedBins, Entry{
 			Dev:  st.Dev,
 			Ino:  st.Ino,
 			Path: line,
-		}
-
-		if section == 1 {
-			watches = append(watches, entry)
-			logMsg(syslog.LOG_INFO, "Watch Target Registered: %s (ino=%d)", line, st.Ino)
-		} else if section == 2 {
-			allows = append(allows, entry)
-			logMsg(syslog.LOG_INFO, "White-listed Binary Registered: %s (ino=%d)", line, st.Ino)
-		}
+		})
+		logMsg(syslog.LOG_INFO, "White-listed Binary Registered: %s (ino=%d)", line, st.Ino)
 	}
 
-	return watches, allows, scanner.Err()
+	return watches, scanner.Err()
 }
 
 // === TOCTOU-Resistant Identity Validation ===
 
-// isAllowed verifies the process backing data using the O_PATH + Fstat technique
-func isAllowed(pid int32) bool {
-	procExe := fmt.Sprintf("/proc/%d/exe", pid)
+// isAllowed verifies the process backing data using the O_PATH + Fstat technique,
+// matching the accessed file's parent directory against per-directory allowlists
+func isAllowed(pid int32, evFd int32) bool {
+	// Resolve the accessed file's path via its proc fd symlink, then derive the
+	// parent directory with filepath.Dir and confirm its identity by Stat.
+	// readlink on a proc magic link is reliable from inside the service's mount
+	// namespace; it avoids the "/proc/self/fd/N/.." path-component traversal which
+	// fails silently under ProtectSystem=strict's private mount namespace.
+	// The subsequent inode comparison closes any TOCTOU window: a renamed or
+	// swapped directory changes its inode on a given device.
+	fdLink := fmt.Sprintf("/proc/self/fd/%d", evFd)
+	filePath, err := os.Readlink(fdLink)
+	if err != nil {
+		logMsg(syslog.LOG_WARNING, "isAllowed: readlink %s failed: %v", fdLink, err)
+		return false
+	}
+
+	var dirSt unix.Stat_t
+	if err := unix.Stat(filepath.Dir(filePath), &dirSt); err != nil {
+		logMsg(syslog.LOG_WARNING, "isAllowed: stat parent of %s failed: %v", filePath, err)
+		return false
+	}
 
 	// O_PATH optimization avoids full data reads or actual access checks on targets
-	fd, err := unix.Open(procExe, unix.O_RDONLY|unix.O_PATH, 0)
+	procExe := fmt.Sprintf("/proc/%d/exe", pid)
+	exeFd, err := unix.Open(procExe, unix.O_RDONLY|unix.O_PATH, 0)
 	if err != nil {
 		// Process vanished or detached since trigger event occurred - strict default deny
 		return false
 	}
-	defer unix.Close(fd)
+	defer unix.Close(exeFd)
 
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
+	var exeSt unix.Stat_t
+	if err := unix.Fstat(exeFd, &exeSt); err != nil {
 		return false
 	}
 
@@ -155,26 +183,32 @@ func isAllowed(pid int32) bool {
 	ctx.RLock()
 	defer ctx.RUnlock()
 
-	for _, bin := range ctx.allowedBins {
-		if bin.Dev == st.Dev && bin.Ino == st.Ino {
-			return true
+	for _, watch := range ctx.watchEntries {
+		if watch.Dev != dirSt.Dev || watch.Ino != dirSt.Ino {
+			continue
 		}
+		// Matched the watch directory -- check against its specific allowlist
+		for _, bin := range watch.AllowedBins {
+			if bin.Dev == exeSt.Dev && bin.Ino == exeSt.Ino {
+				return true
+			}
+		}
+		// Map explicit human-readable string trace for rejection records
+		exePath, err := os.Readlink(procExe)
+		if err != nil {
+			exePath = "<unknown>"
+		}
+		logMsg(syslog.LOG_WARNING, "DENIED access tracking -> pid=%-6d exe=%s dev=%d ino=%d dir=%s",
+			pid, exePath, exeSt.Dev, exeSt.Ino, watch.Path)
+		return false
 	}
 
-	// Map explicit human-readable string trace for rejection records
-	exePath, err := os.Readlink(procExe)
-	if err != nil {
-		exePath = "<unknown>"
-	}
-
-	logMsg(syslog.LOG_WARNING, "DENIED access tracking -> pid=%-6d exe=%s dev=%d ino=%d",
-		pid, exePath, st.Dev, st.Ino)
 	return false
 }
 
 // === Fanotify Operational Helpers ===
 
-func addAllMarks(fanFd int, watches []Entry) {
+func addAllMarks(fanFd int, watches []WatchEntry) {
 	for _, target := range watches {
 		mask := uint64(unix.FAN_OPEN_PERM | unix.FAN_ACCESS_PERM | unix.FAN_EVENT_ON_CHILD)
 		err := unix.FanotifyMark(fanFd, unix.FAN_MARK_ADD, mask, unix.AT_FDCWD, target.Path)
@@ -207,13 +241,12 @@ func main() {
 	defer os.Remove(PidFile)
 
 	// Context configuration ingestion
-	wDirs, aBins, err := loadConfig()
+	wEntries, err := loadConfig()
 	if err != nil {
 		logMsg(syslog.LOG_ERR, "Fatal configuration load failure: %v", err)
 		os.Exit(1)
 	}
-	ctx.watchDirs = wDirs
-	ctx.allowedBins = aBins
+	ctx.watchEntries = wEntries
 
 	// Initialize fanotify channel
 	fanFd, err := unix.FanotifyInit(unix.FAN_CLASS_CONTENT, unix.O_RDONLY|unix.O_LARGEFILE)
@@ -224,7 +257,7 @@ func main() {
 	defer unix.Close(fanFd)
 
 	// Map watches onto security layer
-	addAllMarks(fanFd, ctx.watchDirs)
+	addAllMarks(fanFd, ctx.watchEntries)
 	logMsg(syslog.LOG_INFO, "Daemon functional framework active. Enforcing strict structural baseline.")
 
 	// === Signal Handling Setup ===
@@ -241,13 +274,12 @@ func main() {
 				// Purge historical structural targets
 				_ = unix.FanotifyMark(fanFd, unix.FAN_MARK_FLUSH, 0, unix.AT_FDCWD, "/")
 
-				if newW, newA, err := loadConfig(); err == nil {
+				if newEntries, err := loadConfig(); err == nil {
 					ctx.Lock()
-					ctx.watchDirs = newW
-					ctx.allowedBins = newA
+					ctx.watchEntries = newEntries
 					ctx.Unlock()
 
-					addAllMarks(fanFd, newW)
+					addAllMarks(fanFd, newEntries)
 					logMsg(syslog.LOG_INFO, "Dynamic structural configuration hot-reload complete")
 				} else {
 					logMsg(syslog.LOG_ERR, "Aborting policy hot-reload due to configuration errors: %v", err)
@@ -286,7 +318,7 @@ func main() {
 
 			if ev.Mask&uint64(unix.FAN_OPEN_PERM|unix.FAN_ACCESS_PERM) != 0 {
 				var response uint32 = unix.FAN_DENY
-				if isAllowed(ev.Pid) {
+				if isAllowed(ev.Pid, ev.Fd) {
 					response = unix.FAN_ALLOW
 				}
 

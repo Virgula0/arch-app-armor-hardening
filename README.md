@@ -81,8 +81,8 @@ aa-status   # should show "apparmor module is loaded"
 ## 2. Install AppArmor profiles
 
 ```bash
-sudo cp apparmor-usr.bin.ssh /etc/apparmor.d/usr.bin.ssh
-sudo cp apparmor-usr.bin.git /etc/apparmor.d/usr.bin.git
+sudo cp profiles/apparmor-usr.bin.ssh /etc/apparmor.d/usr.bin.ssh
+sudo cp profiles/apparmor-usr.bin.git /etc/apparmor.d/usr.bin.git
 
 # Load in COMPLAIN mode first --- logs denials without blocking
 sudo apparmor_parser -r /etc/apparmor.d/usr.bin.ssh
@@ -114,17 +114,10 @@ sudo aa-enforce /usr/bin/ssh /usr/bin/git
 ## 3. Build and install the fanotify daemon
 
 ```bash
-sudo pacman -S --needed gcc
-sudo gcc -O2 -Wall -Wextra -o /usr/local/sbin/ssh-guard scripts/ssh-guard-c/ssh-guard.c
-
-# OR compile the go-version, you need go installed at least 1.26
-# this conversion has been done because i did not checked carefully the c script, and the c-version if contains memory corruption vulnerabilities can be exploited for privilege escalation tenchiques
-# use a memory-safe language should prevent this
-
-cd scripts/ssh-guard-go
+cd scripts
 go mod download && go mod verify && go mod tidy
 sudo go build -ldflags="-s -w" -o /usr/local/sbin/ssh-guard ssh-guard.go
-cd ../../
+cd ..
 
 sudo chmod 700 /usr/local/sbin/ssh-guard
 ```
@@ -156,7 +149,7 @@ If you get blocked trying to read a key in `~/ssh` but `ssh-add -l` gave no prob
 ## 4. Install as a systemd service
 
 ```bash
-sudo cp ssh-guard.service /etc/systemd/system/
+sudo cp services/ssh-guard.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ssh-guard
 
@@ -205,7 +198,7 @@ More info: https://wiki.archlinux.org/title/SSH_keys#Start_ssh-agent_with_system
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ssh-agent.service ~/.config/systemd/user/.
+cp services/ssh-agent.service ~/.config/systemd/user/.
 systemctl --user daemon-reload
 systemctl --user enable ssh-agent.service
 systemctl --user start ssh-agent.service
