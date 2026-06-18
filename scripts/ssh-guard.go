@@ -23,21 +23,24 @@ const (
 	PidFile    = "/run/ssh-guard.pid"
 )
 
+// Linux IOCTL specific codes for manipulating file attributes (chattr)
 const (
 	linux_FS_IOC_GETFLAGS = 0x80086601
 	linux_FS_IOC_SETFLAGS = 0x40086602
-	linux_FS_IMMUTABLE_FL = 0x00000010
-	linux_FS_APPEND_FL    = 0x00000020
+	linux_FS_IMMUTABLE_FL = 0x00000010 // +i attribute
+	linux_FS_APPEND_FL    = 0x00000020 // +a attribute
 )
 
 // === Types ===
 
+// Entry acts as a unique filesystem identifier key combining Device and Inode numbers
 type Entry struct {
 	Dev  uint64
 	Ino  uint64
 	Path string
 }
 
+// WatchEntry wraps our root target folder with its specific granular allowances
 type WatchEntry struct {
 	Entry
 	AllowedBins   []Entry
@@ -57,6 +60,7 @@ var ctx = &SecurityContext{}
 
 // === Logging System ===
 
+// logMsg routes critical runtime notifications concurrently to Syslog and Stderr
 func logMsg(prio syslog.Priority, format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
 
@@ -76,6 +80,7 @@ func logMsg(prio syslog.Priority, format string, v ...interface{}) {
 	}
 }
 
+// checkTerminal verifies if Stderr is attached to an interactive terminal session
 func checkTerminal() bool {
 	_, err := unix.IoctlGetTermios(int(os.Stderr.Fd()), unix.TCGETS)
 	return err == nil
@@ -83,6 +88,7 @@ func checkTerminal() bool {
 
 // === Configuration Parser ===
 
+// loadConfig parses configuration and validates paths using active system device/inode resolution
 func loadConfig() ([]WatchEntry, error) {
 	file, err := os.Open(ConfigPath)
 	if err != nil {
@@ -101,6 +107,7 @@ func loadConfig() ([]WatchEntry, error) {
 			continue
 		}
 
+		// Parse watch targets marked via [watch /path] headers
 		if strings.HasPrefix(line, "[watch ") && strings.HasSuffix(line, "]") {
 			dirPath := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))
 
@@ -123,6 +130,7 @@ func loadConfig() ([]WatchEntry, error) {
 			continue
 		}
 
+		// Handle explicit exclusions from +i immutability settings
 		if strings.HasPrefix(line, "exclude_chattr ") {
 			excluded := strings.TrimSpace(strings.TrimPrefix(line, "exclude_chattr "))
 			watches[currentIdx].ExcludedFiles = append(watches[currentIdx].ExcludedFiles, excluded)
@@ -130,6 +138,7 @@ func loadConfig() ([]WatchEntry, error) {
 			continue
 		}
 
+		// Collect and trace allowed binaries for the active watch segment
 		var st unix.Stat_t
 		if err := unix.Stat(line, &st); err != nil {
 			logMsg(syslog.LOG_WARNING, "Skipping missing or unreadable path: %s", line)
@@ -149,7 +158,9 @@ func loadConfig() ([]WatchEntry, error) {
 
 // === TOCTOU-Resistant Identity Validation ===
 
+// isAllowed validates process access authorization using kernel pinning via /proc mounts
 func isAllowed(pid int32, evFd int32) bool {
+	// 1. Resolve target file identity via the open event file descriptor
 	fdLink := fmt.Sprintf("/proc/self/fd/%d", evFd)
 	filePath, err := os.Readlink(fdLink)
 	if err != nil {
@@ -163,6 +174,7 @@ func isAllowed(pid int32, evFd int32) bool {
 		return false
 	}
 
+	// 2. Pin the binary binary using O_PATH to prevent symlink swapping / PID reuse races
 	procExe := fmt.Sprintf("/proc/%d/exe", pid)
 	exeFd, err := unix.Open(procExe, unix.O_RDONLY|unix.O_PATH, 0)
 	if err != nil {
@@ -178,6 +190,7 @@ func isAllowed(pid int32, evFd int32) bool {
 	ctx.RLock()
 	defer ctx.RUnlock()
 
+	// 3. Match Dev and Inode footprints strictly against approved lists
 	for _, watch := range ctx.watchEntries {
 		if watch.Dev != dirSt.Dev || watch.Ino != dirSt.Ino {
 			continue
@@ -201,6 +214,7 @@ func isAllowed(pid int32, evFd int32) bool {
 
 // === Fanotify Operational Helpers ===
 
+// addAllMarks links configured directory watches directly into the kernel's Fanotify context
 func addAllMarks(fanFd int, watches []WatchEntry) {
 	for _, target := range watches {
 		mask := uint64(unix.FAN_OPEN_PERM | unix.FAN_ACCESS_PERM | unix.FAN_EVENT_ON_CHILD)
@@ -211,9 +225,8 @@ func addAllMarks(fanFd int, watches []WatchEntry) {
 	}
 }
 
+// modifyChattr issues raw ioctls to adjust underlying file attributes directly
 func modifyChattr(path string, flag uint32, enable bool) error {
-	// Note: This addition routing through /proc/1/root bypasses systemd ProtectSystem=strict read-only sandboxes.
-	// It works for Arch Linux, linux-hardened setups, and universally on any systemd restricted mounts.
 	realPath := path
 	if filepath.IsAbs(path) {
 		realPath = filepath.Join("/proc/1/root", path)
@@ -248,6 +261,7 @@ func modifyChattr(path string, flag uint32, enable bool) error {
 	return nil
 }
 
+// applyChattr recursively forces system file hardening settings across watched directories
 func applyChattr(watches []WatchEntry) {
 	for _, w := range watches {
 		excludeMap := make(map[string]bool)
@@ -257,14 +271,12 @@ func applyChattr(watches []WatchEntry) {
 
 		err := filepath.WalkDir(w.Path, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
-				logMsg(syslog.LOG_WARNING, "WalkDir skipped %s: %v", path, err)
 				return nil
 			}
 			if path == w.Path {
 				return nil
 			}
 
-			// Skip sockets, symlinks, pipes, and devices. open() on a socket throws ENXIO
 			if !d.Type().IsRegular() && !d.IsDir() {
 				return nil
 			}
@@ -277,7 +289,6 @@ func applyChattr(watches []WatchEntry) {
 			if chattrErr := modifyChattr(path, linux_FS_IMMUTABLE_FL, enable); chattrErr != nil {
 				logMsg(syslog.LOG_WARNING, "Skipped chattr modification on %s: %v", path, chattrErr)
 			}
-
 			return nil
 		})
 		if err != nil {
@@ -287,6 +298,41 @@ func applyChattr(watches []WatchEntry) {
 		err = modifyChattr(w.Path, linux_FS_APPEND_FL, true)
 		if err != nil {
 			logMsg(syslog.LOG_ERR, "Failed +a on %s: %v", w.Path, err)
+		}
+	}
+}
+
+// revertChattr safely unrolls chattr settings allowing for graceful teardown
+func revertChattr(watches []WatchEntry) {
+	for _, w := range watches {
+		// 1. Remove +a from the directory first to allow operations within it
+		err := modifyChattr(w.Path, linux_FS_APPEND_FL, false)
+		if err != nil {
+			logMsg(syslog.LOG_ERR, "Failed removing +a on directory %s: %v", w.Path, err)
+		}
+
+		// 2. Recursively remove +i from all files AND directories (except the root itself)
+		err = filepath.WalkDir(w.Path, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil // Continue even if one file is inaccessible
+			}
+			if path == w.Path {
+				return nil
+			}
+
+			// Process regular files and directories to strip +i; skip symlinks, sockets, etc.
+			if !d.Type().IsRegular() && !d.IsDir() {
+				return nil
+			}
+
+			// Attempt to remove +i
+			if chattrErr := modifyChattr(path, linux_FS_IMMUTABLE_FL, false); chattrErr != nil {
+				logMsg(syslog.LOG_WARNING, "Failed to remove +i from %s: %v", path, chattrErr)
+			}
+			return nil
+		})
+		if err != nil {
+			logMsg(syslog.LOG_ERR, "Error during recursive -i walk: %v", err)
 		}
 	}
 }
@@ -320,6 +366,7 @@ func main() {
 
 	applyChattr(ctx.watchEntries)
 
+	// Initialize the Fanotify synchronous content control subsystem
 	fanFd, err := unix.FanotifyInit(unix.FAN_CLASS_CONTENT, unix.O_RDONLY|unix.O_LARGEFILE)
 	if err != nil {
 		logMsg(syslog.LOG_ERR, "Fanotify structural initialization failure: %v (Are you root?)", err)
@@ -333,6 +380,7 @@ func main() {
 	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 
+	// Async Signal Engine for tracking structural runtime adjustments and safe shutdown
 	go func() {
 		for sig := range sigChan {
 			switch sig {
@@ -346,6 +394,8 @@ func main() {
 					ctx.watchEntries = newEntries
 					ctx.Unlock()
 
+					// We strictly apply on hot-reload. For a highly dynamic system,
+					// reverting the old map first before applying the new map might be preferred.
 					applyChattr(newEntries)
 					addAllMarks(fanFd, newEntries)
 					logMsg(syslog.LOG_INFO, "Dynamic structural configuration hot-reload complete")
@@ -354,8 +404,18 @@ func main() {
 				}
 
 			case syscall.SIGTERM, syscall.SIGINT:
-				logMsg(syslog.LOG_INFO, "Termination request processed. Shutting down...")
+				logMsg(syslog.LOG_INFO, "Termination request processed. Reverting filesystem attributes...")
+				// Close the fanotify fd immediately to stop intercepting file accesses.
+				// Without this our own revert operations would be denied by the running monitor.
 				unix.Close(fanFd)
+
+				ctx.RLock()
+				currentWatches := ctx.watchEntries
+				ctx.RUnlock()
+
+				// Strip locks gracefully
+				revertChattr(currentWatches)
+				logMsg(syslog.LOG_INFO, "Filesystem attributes restored. Shutting down...")
 				os.Exit(0)
 			}
 		}
@@ -363,6 +423,7 @@ func main() {
 
 	var buf [16384]byte
 
+	// Kernel-space Interception Dispatch Loop
 	for {
 		n, err := unix.Read(fanFd, buf[:])
 		if err != nil {
@@ -374,6 +435,7 @@ func main() {
 		}
 
 		offset := 0
+		// Safely decode sequential event structures returned from the kernel buffer stream
 		for offset+int(unsafe.Sizeof(unix.FanotifyEventMetadata{})) <= n {
 			ev := (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[offset]))
 
@@ -382,6 +444,7 @@ func main() {
 				os.Exit(1)
 			}
 
+			// Validate synchronous permission request checks
 			if ev.Mask&uint64(unix.FAN_OPEN_PERM|unix.FAN_ACCESS_PERM) != 0 {
 				var response uint32 = unix.FAN_DENY
 				if isAllowed(ev.Pid, ev.Fd) {
