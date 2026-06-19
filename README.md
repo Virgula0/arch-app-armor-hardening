@@ -135,10 +135,13 @@ sudo nano /etc/ssh-guard/config # Edit the config and replace `alice` with your 
 > All watched directories MUST be encrypted with fscrypt otherwise the daemon will refuse to start.
 
 > [!WARNING]
-> This step will encrypt all of your declared watched directories in ssh-guard.conf using fscrypt
-> Backup your watched directories fisrt, then after you finished, reboot the system
+> This step will encrypt all of your declared watched directories in ssh-guard.conf using fscrypt.
+>
+> Backup your watched directories first, then after you finished the entire setup, reboot the system.
+>
 > If everything is fine and your watched directories are succesfully decrypted by the daemon you can sefely
 > delete your backups.
+>
 > This steps is required to be done only once  unless you add/modify your watched target directories in ssh-guard.comf
 
 ```bash
@@ -187,6 +190,10 @@ Jun 19 13:49:13 green-unit-28136 ssh-guard[24427]: DENIED access tracking -> pid
 
 > [!WARNING]
 > If you need to disable the guard for some reason and access `~/.git` normally from the user you can stop the process temporarly by doing `sudo systemctl stop ssh-guard`
+> At shutdown of the daemon, for security purposes all watched directories are encrypted back using fscrypt.
+>
+> To unlock the volumes and do change and modifications: `sudo fscrypt unlock /home/alice/.ssh --key=/etc/ssh-guard/fscrypt.key`
+> Each of watched directories needs to be unloacked manually!
 >
 > It will be back up and running by rebooting or with `sudo systemctl start ssh-guard`.
 
