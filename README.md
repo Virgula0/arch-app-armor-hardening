@@ -122,31 +122,31 @@ cd ..
 sudo chmod 700 /usr/local/sbin/ssh-guard
 ```
 
-Edit the config and replace `alice` with your username
-
 ```bash
 sudo mkdir -p /etc/ssh-guard
 sudo cp scripts/ssh-guard.conf /etc/ssh-guard/config
 sudo chmod 600 /etc/ssh-guard/config
-sudo nano /etc/ssh-guard/config
+sudo nano /etc/ssh-guard/config # Edit the config and replace `alice` with your username. Customize the config as you need
 ```
 
-## 3.1 Encryption
+### 3.1 Encryption
 
-All watched directories MUST be encrypted.
+> [!IMPORTANT]
+> All watched directories MUST be encrypted with fscrypt otherwise the daemon will refuse to start.
+
+> [!WARNING]
+> This step will encrypt all of your declared watched directories in ssh-guard.conf using fscrypt
+> Backup your watched directories fisrt, then after you finished, reboot the system
+> If everything is fine and your watched directories are succesfully decrypted by the daemon you can sefely
+> delete your backups.
+> This steps is required to be done only once  unless you add/modify your watched target directories in ssh-guard.comf
 
 ```bash
 sudo pacman -S fscrypt
-sudo fscrypt setup
-
-# encrypt all watched directories by the daemon
-# you have manually to do this step once,
-# WARNING, this will encrypt all of your declared watched directories in ssh-guard.conf using fscrypt
-
 sudo ${PWD}/scripts/migration.sh /etc/ssh-guard/config
-
-# ...
 ```
+
+### 3.2 Testing
 
 Test manually if everything works (runs in foreground, logs to stderr):
 
@@ -154,20 +154,19 @@ Test manually if everything works (runs in foreground, logs to stderr):
 sudo /usr/local/sbin/ssh-guard
 
 # In another terminal --- this should work:
-ssh-add -l
-ssh -T git@github.com
+ssh-add -l # list can be eventually empty but ssh-guard will not block this
+ssh -T git@github.com # if you configured a github key
 
 # This should be DENIED (not in whitelist):
 sudo -u ${USER} $ cat /home/alice/.ssh/id_ed25519   # denied if cat not in allow list
 ```
 
-If you get blocked trying to read a key in `~/ssh` but `ssh-add -l` gave no problem you can proceed with next step.
+If you get blocked trying to read a key in `~/.ssh` but `ssh-add -l` gave no problem you can proceed with next step.
 
 ## 4. Install as a systemd service
 
 ```bash
 sudo cp services/ssh-guard.service /etc/systemd/system/
-sudo cp services/ssh-guard-init.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ssh-guard
 
@@ -183,7 +182,7 @@ If it works:
 ```bash
 cat ~/.ssh/github
 
-Jun 13 18:06:46 red-fox-19291 ssh-guard[1145975]: DENIED access tracking -> pid=1149950 exe=/usr/bin/cat dev=64768 ino=45627653
+Jun 19 13:49:13 green-unit-28136 ssh-guard[24427]: DENIED access tracking -> pid=27710  exe=/usr/bin/cat file=/home/alice/.ssh/github dev=65024 ino=135344 dir=/home/alice/.ssh
 ```
 
 > [!WARNING]
