@@ -411,7 +411,8 @@ func reconcileMarks(fanFd int, oldWatches, newWatches []WatchEntry) {
 }
 
 func modifyChattr(path string, flag uint32, enable bool) error {
-	f, err := os.Open(path)
+	// Added O_NONBLOCK to prevent hanging on device files, named pipes, etc.
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return err
 	}
@@ -440,7 +441,8 @@ func applyChattr(watches []WatchEntry) {
 			if err != nil || path == w.Path {
 				return nil
 			}
-			if !d.Type().IsRegular() && !d.IsDir() {
+			// Fix: Only apply immutable to actual regular files, completely bypassing sockets/directories
+			if !d.Type().IsRegular() {
 				return nil
 			}
 			enable := !w.ExcludeSet[d.Name()]
@@ -462,7 +464,8 @@ func revertChattr(watches []WatchEntry) {
 			if err != nil || path == w.Path {
 				return nil
 			}
-			if !d.Type().IsRegular() && !d.IsDir() {
+			// Fix: Revert only on regular files recursively
+			if !d.Type().IsRegular() {
 				return nil
 			}
 			modifyChattr(path, linux_FS_IMMUTABLE_FL, false)
@@ -549,6 +552,16 @@ func runCreateWatcherLoop() {
 				continue
 			}
 			fullPath := filepath.Join(watch.Path, name)
+
+			// Fix: Ensure we only apply chattr to regular files dynamically created
+			st, statErr := os.Lstat(fullPath)
+			if statErr != nil {
+				continue
+			}
+			if !st.Mode().IsRegular() {
+				continue
+			}
+
 			if err := modifyChattr(fullPath, linux_FS_IMMUTABLE_FL, true); err != nil {
 				logMsg(syslog.LOG_WARNING, "Failed to immediately protect new file %s: %v", fullPath, err)
 			} else {
@@ -634,18 +647,62 @@ func main() {
 	os.WriteFile(PidFile, []byte(pidData), 0644)
 	defer os.Remove(PidFile)
 
+	// --- Start fanotify event loop now so that applyChattr can open files without deadlocking ---
+	go func() {
+		var buf [16384]byte
+		for {
+			n, err := unix.Read(fanFd, buf[:])
+			if err != nil {
+				if err == unix.EINTR {
+					continue
+				}
+				// fd closed during shutdown – exit silently
+				break
+			}
+			offset := 0
+			for offset+int(unsafe.Sizeof(unix.FanotifyEventMetadata{})) <= n {
+				ev := (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[offset]))
+				if ev.Vers != unix.FANOTIFY_METADATA_VERSION {
+					os.Exit(1)
+				}
+				if ev.Mask&uint64(unix.FAN_OPEN_PERM|unix.FAN_ACCESS_PERM) != 0 {
+					var response uint32 = unix.FAN_DENY
+					if pidfd, ok := extractPidfd(buf[:], offset, int(ev.Event_len)); ok {
+						if isAllowed(pidfd, ev.Fd) {
+							response = unix.FAN_ALLOW
+						}
+					} else {
+						logMsg(syslog.LOG_WARNING, "DENIED: event for pid=%d carried no pidfd info record - failing closed", ev.Pid)
+					}
+					resp := unix.FanotifyResponse{
+						Fd:       ev.Fd,
+						Response: response,
+					}
+					respBytes := unsafe.Slice((*byte)(unsafe.Pointer(&resp)), int(unsafe.Sizeof(resp)))
+					unix.Write(fanFd, respBytes)
+				}
+				if ev.Fd >= 0 {
+					unix.Close(int(ev.Fd))
+				}
+				offset += int(ev.Event_len)
+			}
+		}
+	}()
+
+	// Now it’s safe to walk and open files inside watched directories
 	applyChattr(ctx.watchEntries)
 
 	if notifySocket := os.Getenv("NOTIFY_SOCKET"); notifySocket != "" {
 		conn, err := net.Dial("unixgram", notifySocket)
 		if err == nil {
-			conn.Write([]byte("READY=1"))
+			conn.Write([]byte("READY=1\n"))
 			conn.Close()
 		}
 	}
 
 	logMsg(syslog.LOG_INFO, "Daemon functional framework active. All directories encrypted and hardened.")
 
+	// Signal handling (original logic, unchanged)
 	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
@@ -670,7 +727,6 @@ func main() {
 
 			case syscall.SIGTERM, syscall.SIGINT:
 				logMsg(syslog.LOG_INFO, "Caught termination signal. Initiating secure lockdown...")
-
 				shuttingDown.Store(true)
 
 				ctx.RLock()
@@ -679,6 +735,7 @@ func main() {
 
 				revertChattr(currentWatches)
 
+				// Stop the create watcher (inotify) first
 				createWatcher.Lock()
 				for wd := range createWatcher.wdToDir {
 					unix.InotifyRmWatch(createWatcher.fd, uint32(wd))
@@ -688,11 +745,22 @@ func main() {
 				}
 				createWatcher.Unlock()
 
+				// ★ Remove fanotify marks BEFORE locking fscrypt
+				mask := uint64(unix.FAN_OPEN_PERM | unix.FAN_ACCESS_PERM | unix.FAN_EVENT_ON_CHILD)
+				for _, w := range currentWatches {
+					unix.FanotifyMark(fanFd, unix.FAN_MARK_REMOVE, mask, unix.AT_FDCWD, w.Path)
+				}
+				// Flush any pending events and close the fanotify fd
+				unix.FanotifyMark(fanFd, unix.FAN_MARK_FLUSH, 0, unix.AT_FDCWD, "")
+				unix.Close(fanFd)
+
+				// Now no references to the encrypted directories remain → key removal can succeed
 				for _, w := range currentWatches {
 					locked := false
 					for i := 0; i < 100; i++ {
 						if err := lockWithFscrypt(w.Path); err != nil {
-							if strings.Contains(err.Error(), "some files using the key are still open") || strings.Contains(err.Error(), "in use") {
+							if strings.Contains(err.Error(), "some files using the key are still open") ||
+								strings.Contains(err.Error(), "in use") {
 								time.Sleep(10 * time.Millisecond)
 								continue
 							}
@@ -705,14 +773,9 @@ func main() {
 						}
 					}
 					if !locked {
-						logMsg(syslog.LOG_WARNING, "Could not fully lock %s (partially locked)", w.Path)
+						logMsg(syslog.LOG_WARNING, "Could not fully lock %s", w.Path)
 					}
 				}
-
-				unix.FanotifyMark(fanFd, unix.FAN_MARK_FLUSH, 0, unix.AT_FDCWD, "")
-				unix.Close(fanFd)
-
-				time.Sleep(100 * time.Millisecond)
 
 				logMsg(syslog.LOG_INFO, "Shutdown complete. All vaults secure.")
 				os.Exit(0)
@@ -720,41 +783,6 @@ func main() {
 		}
 	}()
 
-	var buf [16384]byte
-	for {
-		n, err := unix.Read(fanFd, buf[:])
-		if err != nil {
-			if err == unix.EINTR {
-				continue
-			}
-			break
-		}
-		offset := 0
-		for offset+int(unsafe.Sizeof(unix.FanotifyEventMetadata{})) <= n {
-			ev := (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[offset]))
-			if ev.Vers != unix.FANOTIFY_METADATA_VERSION {
-				os.Exit(1)
-			}
-			if ev.Mask&uint64(unix.FAN_OPEN_PERM|unix.FAN_ACCESS_PERM) != 0 {
-				var response uint32 = unix.FAN_DENY
-				if pidfd, ok := extractPidfd(buf[:], offset, int(ev.Event_len)); ok {
-					if isAllowed(pidfd, ev.Fd) {
-						response = unix.FAN_ALLOW
-					}
-				} else {
-					logMsg(syslog.LOG_WARNING, "DENIED: event for pid=%d carried no pidfd info record - failing closed", ev.Pid)
-				}
-				resp := unix.FanotifyResponse{
-					Fd:       ev.Fd,
-					Response: response,
-				}
-				respBytes := unsafe.Slice((*byte)(unsafe.Pointer(&resp)), int(unsafe.Sizeof(resp)))
-				unix.Write(fanFd, respBytes)
-			}
-			if ev.Fd >= 0 {
-				unix.Close(int(ev.Fd))
-			}
-			offset += int(ev.Event_len)
-		}
-	}
+	// Block forever – the signal handler will terminate the process
+	select {}
 }
