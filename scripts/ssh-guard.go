@@ -24,7 +24,6 @@ import (
 )
 
 // === Configuration Constants ===
-
 const (
 	ConfigPath     = "/etc/ssh-guard/config"
 	PidFile        = "/run/ssh-guard.pid"
@@ -41,8 +40,44 @@ const (
 	linux_FS_IOC_GET_ENCRYPTION_POLICY_EX = 0xc0096616
 )
 
-// === Types ===
+// === fanotify pidfd-reporting constants ===
+// Defined locally (rather than relying on golang.org/x/sys/unix to export
+// them under these exact names) so the patch doesn't depend on a specific
+// x/sys version. Values come straight from the kernel's
+// include/uapi/linux/fanotify.h.
+const (
+	localFanReportPidfd         = 0x00000080 // FAN_REPORT_PIDFD
+	fanEventInfoTypePidfd       = 0x04       // FAN_EVENT_INFO_TYPE_PIDFD
+	fanNoPidfd            int32 = -1         // FAN_NOPIDFD
+	fanEPidfd             int32 = -2         // FAN_EPIDFD
+)
 
+// fanotifyEventInfoHeader / fanotifyEventInfoPidfd mirror the kernel structs:
+//
+//	struct fanotify_event_info_header {
+//	    __u8  info_type;
+//	    __u8  pad;
+//	    __u16 len;
+//	};
+//	struct fanotify_event_info_pidfd {
+//	    struct fanotify_event_info_header hdr;
+//	    __s32 pidfd;
+//	};
+//
+// These trail the fixed-size unix.FanotifyEventMetadata when the fanotify
+// group was initialized with FAN_REPORT_PIDFD, up to ev.Event_len bytes.
+type fanotifyEventInfoHeader struct {
+	InfoType uint8
+	Pad      uint8
+	Len      uint16
+}
+
+type fanotifyEventInfoPidfd struct {
+	Hdr   fanotifyEventInfoHeader
+	Pidfd int32
+}
+
+// === Types ===
 type Entry struct {
 	Dev  uint64
 	Ino  uint64
@@ -53,6 +88,9 @@ type WatchEntry struct {
 	Entry
 	AllowedBins   []Entry
 	ExcludedFiles []string
+	// ExcludeSet is ExcludedFiles pre-indexed for O(1) lookup; populated by
+	// loadConfig once parsing of a [watch ...] block is complete.
+	ExcludeSet map[string]bool
 }
 
 type SecurityContext struct {
@@ -70,7 +108,6 @@ type fscryptAddKeyArgFull struct {
 }
 
 // === Logging System ===
-
 func logMsg(prio syslog.Priority, format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
 	if ctx.syslogW != nil {
@@ -93,11 +130,9 @@ func checkTerminal() bool {
 	return err == nil
 }
 
-// === Fscrypt Subsystem (Key management, NO migration) ===
-
+// === Fscrypt Subsystem (Key management, NO migration) === (unchanged)
 func getOrGenerateKey() ([]byte, error) {
 	key := make([]byte, FscryptKeySize)
-
 	f, err := os.OpenFile(MasterKeyFile, os.O_RDONLY, 0400)
 	if err == nil {
 		defer f.Close()
@@ -106,19 +141,16 @@ func getOrGenerateKey() ([]byte, error) {
 		}
 		return key, nil
 	}
-
 	if os.IsNotExist(err) {
 		logMsg(syslog.LOG_INFO, "Generating new fscrypt master key...")
 		if _, err := io.ReadFull(rand.Reader, key); err != nil {
 			return nil, err
 		}
-
 		f, err = os.OpenFile(MasterKeyFile, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0400)
 		if err != nil {
 			return nil, err
 		}
 		defer f.Close()
-
 		if _, err := f.Write(key); err != nil {
 			return nil, err
 		}
@@ -132,16 +164,13 @@ func unlockWithFscrypt(dirPath string) error {
 	if err != nil {
 		return fmt.Errorf("fscrypt context for %s: %w", dirPath, err)
 	}
-
 	policy, err := actions.GetPolicyFromPath(fsctx, dirPath)
 	if err != nil {
 		return fmt.Errorf("get policy for %s: %w", dirPath, err)
 	}
-
 	if policy.IsProvisionedByTargetUser() {
 		return nil // already unlocked (e.g. on SIGHUP reload)
 	}
-
 	keyBytes, err := os.ReadFile(MasterKeyFile)
 	if err != nil {
 		return fmt.Errorf("read master key: %w", err)
@@ -151,7 +180,6 @@ func unlockWithFscrypt(dirPath string) error {
 			keyBytes[i] = 0
 		}
 	}()
-
 	// There's exactly one raw_key protector on this policy — always pick it.
 	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
 		return 0, nil
@@ -159,12 +187,10 @@ func unlockWithFscrypt(dirPath string) error {
 	keyFn := func(_ actions.ProtectorInfo, _ bool) (*crypto.Key, error) {
 		return crypto.NewFixedLengthKeyFromReader(bytes.NewReader(keyBytes), FscryptKeySize)
 	}
-
 	if err := policy.Unlock(optionFn, keyFn); err != nil {
 		return fmt.Errorf("unlock policy for %s: %w", dirPath, err)
 	}
 	defer policy.Lock()
-
 	if err := policy.Provision(); err != nil {
 		return fmt.Errorf("provision policy for %s: %w", dirPath, err)
 	}
@@ -178,48 +204,39 @@ func hasEncryptionPolicy(dirPath string) (bool, error) {
 		return false, fmt.Errorf("open %s: %w", dirPath, err)
 	}
 	defer unix.Close(dirFd)
-
 	var arg unix.FscryptGetPolicyExArg
 	arg.Size = 24 // size of the policy union inside the kernel structure
-
 	_, _, errno := unix.Syscall(
 		unix.SYS_IOCTL,
 		uintptr(dirFd),
 		uintptr(linux_FS_IOC_GET_ENCRYPTION_POLICY_EX),
 		uintptr(unsafe.Pointer(&arg)),
 	)
-
 	if errno == 0 {
 		return true, nil
 	}
-
-	// ENODATA – no policy present; EOPNOTSUPP – filesystem doesn’t support fscrypt at all
+	// ENODATA – no policy present; EOPNOTSUPP – filesystem doesn't support fscrypt at all
 	if errors.Is(errno, unix.ENODATA) || errors.Is(errno, unix.EOPNOTSUPP) {
 		return false, nil
 	}
-
 	return false, fmt.Errorf("ioctl GET_ENCRYPTION_POLICY_EX on %s: %w", dirPath, errno)
 }
 
 // === Configuration Parser ===
-
 func loadConfig() ([]WatchEntry, error) {
 	file, err := os.Open(ConfigPath)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-
 	var watches []WatchEntry
 	currentIdx := -1
 	scanner := bufio.NewScanner(file)
-
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
 		if strings.HasPrefix(line, "[watch ") && strings.HasSuffix(line, "]") {
 			dirPath := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[watch "), "]"))
 			var st unix.Stat_t
@@ -229,22 +246,21 @@ func loadConfig() ([]WatchEntry, error) {
 				continue
 			}
 			watches = append(watches, WatchEntry{
-				Entry: Entry{Dev: st.Dev, Ino: st.Ino, Path: dirPath},
+				Entry:      Entry{Dev: st.Dev, Ino: st.Ino, Path: dirPath},
+				ExcludeSet: make(map[string]bool),
 			})
 			currentIdx = len(watches) - 1
 			continue
 		}
-
 		if currentIdx < 0 {
 			continue
 		}
-
 		if strings.HasPrefix(line, "exclude_chattr ") {
 			excluded := strings.TrimSpace(strings.TrimPrefix(line, "exclude_chattr "))
 			watches[currentIdx].ExcludedFiles = append(watches[currentIdx].ExcludedFiles, excluded)
+			watches[currentIdx].ExcludeSet[excluded] = true
 			continue
 		}
-
 		var st unix.Stat_t
 		if err := unix.Stat(line, &st); err != nil {
 			continue
@@ -255,21 +271,77 @@ func loadConfig() ([]WatchEntry, error) {
 			Path: line,
 		})
 	}
-
 	return watches, scanner.Err()
 }
 
-// === TOCTOU-Resistant Identity Validation ===
+// === pidfd identity resolution (replaces the old pid-number-only check) ===
+func extractPidfd(buf []byte, evStart, evLen int) (int32, bool) {
+	metaSize := int(unsafe.Sizeof(unix.FanotifyEventMetadata{}))
+	pos := evStart + metaSize
+	end := evStart + evLen
+	for pos+4 <= end && pos+4 <= len(buf) {
+		hdr := (*fanotifyEventInfoHeader)(unsafe.Pointer(&buf[pos]))
+		recLen := int(hdr.Len)
+		if recLen < 4 || pos+recLen > end || pos+recLen > len(buf) {
+			break
+		}
+		if hdr.InfoType == fanEventInfoTypePidfd && recLen >= 8 {
+			rec := (*fanotifyEventInfoPidfd)(unsafe.Pointer(&buf[pos]))
+			return rec.Pidfd, true
+		}
+		pos += recLen
+	}
+	return 0, false
+}
 
-func isAllowed(pid int32, evFd int32) bool {
+// resolvePidFromPidfd reads the pid currently backing a pidfd via
+// /proc/self/fdinfo. Because we hold the pidfd open the whole time, this
+// pid cannot have been handed out to an unrelated process in the interim.
+func resolvePidFromPidfd(pidfd int32) (int, error) {
+	fdinfoPath := fmt.Sprintf("/proc/self/fdinfo/%d", pidfd)
+	data, err := os.ReadFile(fdinfoPath)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", fdinfoPath, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "Pid:") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 {
+				return 0, fmt.Errorf("malformed Pid line in %s", fdinfoPath)
+			}
+			var pid int
+			if _, err := fmt.Sscanf(fields[1], "%d", &pid); err != nil {
+				return 0, fmt.Errorf("parse pid in %s: %w", fdinfoPath, err)
+			}
+			return pid, nil
+		}
+	}
+	return 0, fmt.Errorf("no Pid field in %s", fdinfoPath)
+}
+
+// === TOCTOU-Resistant Identity Validation ===
+// pidfd is the event's pidfd (see extractPidfd). isAllowed takes ownership
+// of it and always closes it before returning.
+func isAllowed(pidfd int32, evFd int32) bool {
+	if pidfd == fanNoPidfd || pidfd == fanEPidfd || pidfd < 0 {
+		logMsg(syslog.LOG_WARNING, "DENIED: event carried no usable pidfd (raw=%d) — failing closed", pidfd)
+		return false
+	}
+	defer unix.Close(int(pidfd))
+
 	fdLink := fmt.Sprintf("/proc/self/fd/%d", evFd)
 	filePath, err := os.Readlink(fdLink)
 	if err != nil {
 		return false
 	}
-
 	var dirSt unix.Stat_t
 	if err := unix.Stat(filepath.Dir(filePath), &dirSt); err != nil {
+		return false
+	}
+
+	pid, err := resolvePidFromPidfd(pidfd)
+	if err != nil {
+		logMsg(syslog.LOG_WARNING, "DENIED: could not resolve pid from pidfd: %v", err)
 		return false
 	}
 
@@ -279,15 +351,24 @@ func isAllowed(pid int32, evFd int32) bool {
 		return false
 	}
 	defer unix.Close(exeFd)
-
 	var exeSt unix.Stat_t
 	if err := unix.Fstat(exeFd, &exeSt); err != nil {
 		return false
 	}
 
+	// Re-validate liveness through the SAME pidfd after resolving identity.
+	// The pidfd pins the kernel's struct pid, so the pid number itself
+	// cannot have been recycled to a different process between the two
+	// checks above; this just catches the case where the legitimate
+	// process has since exited, in which case we fail closed rather than
+	// trusting a stale resolution.
+	if err := unix.PidfdSendSignal(int(pidfd), 0, nil, 0); err != nil {
+		logMsg(syslog.LOG_WARNING, "DENIED: process behind pidfd %d no longer alive: %v", pidfd, err)
+		return false
+	}
+
 	ctx.RLock()
 	defer ctx.RUnlock()
-
 	for _, watch := range ctx.watchEntries {
 		if watch.Dev != dirSt.Dev || watch.Ino != dirSt.Ino {
 			continue
@@ -308,7 +389,6 @@ func isAllowed(pid int32, evFd int32) bool {
 }
 
 // === Fanotify Operational Helpers ===
-
 func addAllMarks(fanFd int, watches []WatchEntry) {
 	for _, target := range watches {
 		mask := uint64(unix.FAN_OPEN_PERM | unix.FAN_ACCESS_PERM | unix.FAN_EVENT_ON_CHILD)
@@ -319,26 +399,46 @@ func addAllMarks(fanFd int, watches []WatchEntry) {
 	}
 }
 
+// reconcileMarks replaces the old "FAN_MARK_FLUSH then re-add" SIGHUP
+// It adds marks for the new configuration FIRST,
+// then removes marks only for directories that dropped out of the config.
+// At no point are watches that survive the reload left unmarked, so there
+// is no window where the daemon stops enforcing for existing directories.
+func reconcileMarks(fanFd int, oldWatches, newWatches []WatchEntry) {
+	addAllMarks(fanFd, newWatches) // idempotent for paths already marked
+
+	newSet := make(map[string]bool, len(newWatches))
+	for _, w := range newWatches {
+		newSet[w.Path] = true
+	}
+	mask := uint64(unix.FAN_OPEN_PERM | unix.FAN_ACCESS_PERM | unix.FAN_EVENT_ON_CHILD)
+	for _, w := range oldWatches {
+		if newSet[w.Path] {
+			continue
+		}
+		if err := unix.FanotifyMark(fanFd, unix.FAN_MARK_REMOVE, mask, unix.AT_FDCWD, w.Path); err != nil {
+			logMsg(syslog.LOG_WARNING, "Failed to remove stale mark on %s: %v", w.Path, err)
+		}
+	}
+}
+
 func modifyChattr(path string, flag uint32, enable bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	fd := f.Fd()
 	var flags uint32
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, fd, uintptr(linux_FS_IOC_GETFLAGS), uintptr(unsafe.Pointer(&flags)))
 	if errno != 0 {
 		return errno
 	}
-
 	if enable {
 		flags |= flag
 	} else {
 		flags &^= flag
 	}
-
 	_, _, errno = unix.Syscall(unix.SYS_IOCTL, fd, uintptr(linux_FS_IOC_SETFLAGS), uintptr(unsafe.Pointer(&flags)))
 	if errno != 0 {
 		return errno
@@ -348,11 +448,6 @@ func modifyChattr(path string, flag uint32, enable bool) error {
 
 func applyChattr(watches []WatchEntry) {
 	for _, w := range watches {
-		excludeMap := make(map[string]bool)
-		for _, ex := range w.ExcludedFiles {
-			excludeMap[ex] = true
-		}
-
 		_ = filepath.WalkDir(w.Path, func(path string, d os.DirEntry, err error) error {
 			if err != nil || path == w.Path {
 				return nil
@@ -360,7 +455,7 @@ func applyChattr(watches []WatchEntry) {
 			if !d.Type().IsRegular() && !d.IsDir() {
 				return nil
 			}
-			enable := !excludeMap[d.Name()]
+			enable := !w.ExcludeSet[d.Name()]
 			if chattrErr := modifyChattr(path, linux_FS_IMMUTABLE_FL, enable); chattrErr != nil {
 				logMsg(syslog.LOG_WARNING, "chattr +i failed on %s: %v", path, chattrErr)
 			}
@@ -388,8 +483,95 @@ func revertChattr(watches []WatchEntry) {
 	}
 }
 
-// === Application Entrypoint ===
+// === Create-time hardening ===
+type createWatchState struct {
+	sync.RWMutex
+	fd      int
+	wdToDir map[int32]WatchEntry
+}
 
+var createWatcher = &createWatchState{}
+
+func startCreateWatcher() error {
+	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("inotify_init1: %w", err)
+	}
+	createWatcher.fd = fd
+	createWatcher.wdToDir = make(map[int32]WatchEntry)
+	go runCreateWatcherLoop()
+	return nil
+}
+
+// reconcileCreateWatches re-points the inotify watches at the current
+// config. Unlike reconcileMarks, a brief drop-add gap here is low severity:
+// inotify carries no permission semantics, so even during the gap a new
+// file just stays mutable a little longer — fanotify enforcement (the
+// actual read-blocking mechanism) is completely unaffected by this.
+func reconcileCreateWatches(watches []WatchEntry) {
+	createWatcher.Lock()
+	defer createWatcher.Unlock()
+	for wd := range createWatcher.wdToDir {
+		unix.InotifyRmWatch(createWatcher.fd, uint32(wd))
+	}
+	createWatcher.wdToDir = make(map[int32]WatchEntry)
+	for _, w := range watches {
+		wd, err := unix.InotifyAddWatch(createWatcher.fd, w.Path, unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO)
+		if err != nil {
+			logMsg(syslog.LOG_WARNING, "Failed to add create-watch on %s: %v", w.Path, err)
+			continue
+		}
+		createWatcher.wdToDir[int32(wd)] = w
+	}
+}
+
+const inotifyEventHeaderSize = int(unsafe.Sizeof(unix.InotifyEvent{}))
+
+func runCreateWatcherLoop() {
+	buf := make([]byte, 65536)
+	for {
+		n, err := unix.Read(createWatcher.fd, buf)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			logMsg(syslog.LOG_ERR, "create-watcher read failed, stopping: %v", err)
+			return
+		}
+		offset := 0
+		for offset+inotifyEventHeaderSize <= n {
+			raw := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+			nameLen := int(raw.Len)
+			var name string
+			if nameLen > 0 && offset+inotifyEventHeaderSize+nameLen <= n {
+				nameBytes := buf[offset+inotifyEventHeaderSize : offset+inotifyEventHeaderSize+nameLen]
+				name = strings.TrimRight(string(nameBytes), "\x00")
+			}
+			offset += inotifyEventHeaderSize + nameLen
+
+			if name == "" {
+				continue
+			}
+			createWatcher.RLock()
+			watch, ok := createWatcher.wdToDir[raw.Wd]
+			createWatcher.RUnlock()
+			if !ok {
+				continue
+			}
+			if watch.ExcludeSet[name] {
+				continue
+			}
+			fullPath := filepath.Join(watch.Path, name)
+			if err := modifyChattr(fullPath, linux_FS_IMMUTABLE_FL, true); err != nil {
+				logMsg(syslog.LOG_WARNING, "Failed to immediately protect new file %s: %v", fullPath, err)
+			} else {
+				logMsg(syslog.LOG_INFO, "Applied +i immediately to new file %s", fullPath)
+			}
+		}
+	}
+}
+
+// === Application Entrypoint ===
 func main() {
 	genKey := flag.Bool("genkey", false, "Generate master key file and exit")
 	flag.Parse()
@@ -413,7 +595,6 @@ func main() {
 	}
 
 	logMsg(syslog.LOG_INFO, "ssh-guard daemon starting (pid %d)", os.Getpid())
-
 	os.MkdirAll("/etc/ssh-guard", 0700)
 
 	wEntries, err := loadConfig()
@@ -454,17 +635,22 @@ func main() {
 	os.WriteFile(PidFile, []byte(pidData), 0644)
 	defer os.Remove(PidFile)
 
-	// Re‑apply immutable/append‑only attributes – they may have been cleared by migration
+	// Re-apply immutable/append-only attributes – they may have been cleared by migration
 	applyChattr(ctx.watchEntries)
 
-	fanFd, err := unix.FanotifyInit(unix.FAN_CLASS_CONTENT, unix.O_RDONLY|unix.O_LARGEFILE)
+	fanFd, err := unix.FanotifyInit(unix.FAN_CLASS_CONTENT|localFanReportPidfd, unix.O_RDONLY|unix.O_LARGEFILE)
 	if err != nil {
 		logMsg(syslog.LOG_ERR, "Fanotify initialization failure: %v", err)
 		os.Exit(1)
 	}
 	defer unix.Close(fanFd)
-
 	addAllMarks(fanFd, ctx.watchEntries)
+
+	if err := startCreateWatcher(); err != nil {
+		logMsg(syslog.LOG_ERR, "Failed to start create-watcher: %v", err)
+		os.Exit(1)
+	}
+	reconcileCreateWatches(ctx.watchEntries)
 
 	// Signal systemd that we are ready (keys injected, marks active)
 	if notifySocket := os.Getenv("NOTIFY_SOCKET"); notifySocket != "" {
@@ -479,19 +665,26 @@ func main() {
 
 	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
-
 	go func() {
 		for sig := range sigChan {
 			switch sig {
 			case syscall.SIGHUP:
-				unix.FanotifyMark(fanFd, unix.FAN_MARK_FLUSH, 0, unix.AT_FDCWD, "/")
-				if newEntries, err := loadConfig(); err == nil {
-					ctx.Lock()
-					ctx.watchEntries = newEntries
-					ctx.Unlock()
-					applyChattr(newEntries)
-					addAllMarks(fanFd, newEntries)
+				newEntries, err := loadConfig()
+				if err != nil {
+					logMsg(syslog.LOG_ERR, "Reload failed, keeping previous configuration: %v", err)
+					continue
 				}
+
+				ctx.Lock()
+				oldEntries := ctx.watchEntries
+				ctx.watchEntries = newEntries
+				ctx.Unlock()
+
+				applyChattr(newEntries)
+				reconcileMarks(fanFd, oldEntries, newEntries)
+				reconcileCreateWatches(newEntries)
+				logMsg(syslog.LOG_INFO, "Configuration reloaded without dropping fanotify protection")
+
 			case syscall.SIGTERM, syscall.SIGINT:
 				unix.Close(fanFd)
 				ctx.RLock()
@@ -512,18 +705,20 @@ func main() {
 			}
 			break
 		}
-
 		offset := 0
 		for offset+int(unsafe.Sizeof(unix.FanotifyEventMetadata{})) <= n {
 			ev := (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[offset]))
 			if ev.Vers != unix.FANOTIFY_METADATA_VERSION {
 				os.Exit(1)
 			}
-
 			if ev.Mask&uint64(unix.FAN_OPEN_PERM|unix.FAN_ACCESS_PERM) != 0 {
 				var response uint32 = unix.FAN_DENY
-				if isAllowed(ev.Pid, ev.Fd) {
-					response = unix.FAN_ALLOW
+				if pidfd, ok := extractPidfd(buf[:], offset, int(ev.Event_len)); ok {
+					if isAllowed(pidfd, ev.Fd) {
+						response = unix.FAN_ALLOW
+					}
+				} else {
+					logMsg(syslog.LOG_WARNING, "DENIED: event for pid=%d carried no pidfd info record - failing closed", ev.Pid)
 				}
 				resp := unix.FanotifyResponse{
 					Fd:       ev.Fd,
@@ -532,7 +727,6 @@ func main() {
 				respBytes := unsafe.Slice((*byte)(unsafe.Pointer(&resp)), int(unsafe.Sizeof(resp)))
 				unix.Write(fanFd, respBytes)
 			}
-
 			if ev.Fd >= 0 {
 				unix.Close(int(ev.Fd))
 			}
