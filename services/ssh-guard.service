@@ -1,7 +1,7 @@
 [Unit]
 Description=SSH directory access guard (fanotify)
 Documentation=man:fanotify(7)
-After=local-fs.target
+After=local-fs.target ssh-guard-init.service
 Before=sshd.service
 
 [Service]
@@ -11,19 +11,15 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 
-# Keep privileges — fanotify PERM events require CAP_SYS_ADMIN
 User=root
 Group=root
 
-# Harden the service itself (it doesn't need most kernel interfaces)
 PrivateTmp=yes
 PrivateNetwork=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/run
+ProtectSystem=yes
+ReadWritePaths=/run /etc/ssh-guard
 NoNewPrivileges=yes
 
-# Log to journal — view with: journalctl -u ssh-guard -f
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ssh-guard

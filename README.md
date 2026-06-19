@@ -131,6 +131,23 @@ sudo chmod 600 /etc/ssh-guard/config
 sudo nano /etc/ssh-guard/config
 ```
 
+## 3.1 Encryption
+
+All watched directories MUST be encrypted.
+
+```bash
+sudo pacman -S fscrypt
+sudo fscrypt setup
+
+# encrypt all watched directories by the daemon
+# you have manually to do this step once,
+# WARNING, this will encrypt all of your declared watched directories in ssh-guard.conf using fscrypt
+
+sudo ${PWD}/scripts/migration.sh /etc/ssh-guard/config
+
+# ...
+```
+
 Test manually if everything works (runs in foreground, logs to stderr):
 
 ```bash
@@ -150,6 +167,7 @@ If you get blocked trying to read a key in `~/ssh` but `ssh-add -l` gave no prob
 
 ```bash
 sudo cp services/ssh-guard.service /etc/systemd/system/
+sudo cp services/ssh-guard-init.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ssh-guard
 
@@ -238,4 +256,4 @@ At this point, `ssh -T git@github.com` should work and `ssh-add -l` should show 
 
 ### Notes
 
-Scripts have been generated using `Claude.ai`
+Scripts have been generated using `gemini` and `deepseek`
