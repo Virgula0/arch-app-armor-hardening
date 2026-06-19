@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -42,10 +43,6 @@ const (
 )
 
 // === fanotify pidfd-reporting constants ===
-// Defined locally (rather than relying on golang.org/x/sys/unix to export
-// them under these exact names) so the patch doesn't depend on a specific
-// x/sys version. Values come straight from the kernel's
-// include/uapi/linux/fanotify.h.
 const (
 	localFanReportPidfd         = 0x00000080 // FAN_REPORT_PIDFD
 	fanEventInfoTypePidfd       = 0x04       // FAN_EVENT_INFO_TYPE_PIDFD
@@ -53,7 +50,6 @@ const (
 	fanEPidfd             int32 = -2         // FAN_EPIDFD
 )
 
-// fanotifyEventInfoHeader / fanotifyEventInfoPidfd mirror the kernel structs:
 type fanotifyEventInfoHeader struct {
 	InfoType uint8
 	Pad      uint8
@@ -87,6 +83,7 @@ type SecurityContext struct {
 }
 
 var ctx = &SecurityContext{}
+var shuttingDown atomic.Bool
 
 type fscryptAddKeyArgFull struct {
 	Header unix.FscryptAddKeyArg
@@ -146,7 +143,7 @@ func getOrGenerateKey() ([]byte, error) {
 }
 
 func unlockWithFscrypt(dirPath string) error {
-	fsctx, err := actions.NewContextFromPath(dirPath, nil) // nil = current user (root)
+	fsctx, err := actions.NewContextFromPath(dirPath, nil)
 	if err != nil {
 		return fmt.Errorf("fscrypt context for %s: %w", dirPath, err)
 	}
@@ -155,7 +152,7 @@ func unlockWithFscrypt(dirPath string) error {
 		return fmt.Errorf("get policy for %s: %w", dirPath, err)
 	}
 	if policy.IsProvisionedByTargetUser() {
-		return nil // already unlocked
+		return nil
 	}
 	keyBytes, err := os.ReadFile(MasterKeyFile)
 	if err != nil {
@@ -182,7 +179,6 @@ func unlockWithFscrypt(dirPath string) error {
 	return nil
 }
 
-// lockWithFscrypt removes the key from the kernel keyring and drops VFS caches
 func lockWithFscrypt(dirPath string) error {
 	fsctx, err := actions.NewContextFromPath(dirPath, nil)
 	if err != nil {
@@ -193,9 +189,8 @@ func lockWithFscrypt(dirPath string) error {
 		return fmt.Errorf("get policy for %s: %w", dirPath, err)
 	}
 	if !policy.IsProvisionedByTargetUser() {
-		return nil // already locked
+		return nil
 	}
-	// Deprovision(true) clears the key and drops cached inodes/pages
 	if err := policy.Deprovision(true); err != nil {
 		return fmt.Errorf("deprovision policy for %s: %w", dirPath, err)
 	}
@@ -319,13 +314,26 @@ func resolvePidFromPidfd(pidfd int32) (int, error) {
 	return 0, fmt.Errorf("no Pid field in %s", fdinfoPath)
 }
 
-// === TOCTOU-Resistant Identity Validation ===
 func isAllowed(pidfd int32, evFd int32) bool {
 	if pidfd == fanNoPidfd || pidfd == fanEPidfd || pidfd < 0 {
 		logMsg(syslog.LOG_WARNING, "DENIED: event carried no usable pidfd (raw=%d) — failing closed", pidfd)
 		return false
 	}
 	defer unix.Close(int(pidfd))
+
+	pid, err := resolvePidFromPidfd(pidfd)
+	if err != nil {
+		logMsg(syslog.LOG_WARNING, "DENIED: could not resolve pid from pidfd: %v", err)
+		return false
+	}
+
+	if pid == os.Getpid() {
+		return true
+	}
+
+	if shuttingDown.Load() {
+		return false
+	}
 
 	fdLink := fmt.Sprintf("/proc/self/fd/%d", evFd)
 	filePath, err := os.Readlink(fdLink)
@@ -335,17 +343,6 @@ func isAllowed(pidfd int32, evFd int32) bool {
 	var dirSt unix.Stat_t
 	if err := unix.Stat(filepath.Dir(filePath), &dirSt); err != nil {
 		return false
-	}
-
-	pid, err := resolvePidFromPidfd(pidfd)
-	if err != nil {
-		logMsg(syslog.LOG_WARNING, "DENIED: could not resolve pid from pidfd: %v", err)
-		return false
-	}
-
-	// === check while shutting down the deamon, applying chattr and re-encrypting everything ===
-	if pid == os.Getpid() {
-		return true
 	}
 
 	procExe := fmt.Sprintf("/proc/%d/exe", pid)
@@ -521,7 +518,6 @@ func runCreateWatcherLoop() {
 			if err == unix.EINTR {
 				continue
 			}
-			// Catch the expected error when the main thread closes the FD during shutdown
 			if err == unix.EBADF || strings.Contains(err.Error(), "bad file descriptor") {
 				logMsg(syslog.LOG_INFO, "create-watcher loop cleanly exited.")
 				return
@@ -613,19 +609,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	for _, w := range wEntries {
-		if err := unlockWithFscrypt(w.Path); err != nil {
-			logMsg(syslog.LOG_ERR, "Failed to inject fscrypt key for %s: %v", w.Path, err)
-			os.Exit(1)
-		}
-	}
-
-	pidData := fmt.Sprintf("%d\n", os.Getpid())
-	os.WriteFile(PidFile, []byte(pidData), 0644)
-	defer os.Remove(PidFile)
-
-	applyChattr(ctx.watchEntries)
-
 	fanFd, err := unix.FanotifyInit(unix.FAN_CLASS_CONTENT|localFanReportPidfd, unix.O_RDONLY|unix.O_LARGEFILE)
 	if err != nil {
 		logMsg(syslog.LOG_ERR, "Fanotify initialization failure: %v", err)
@@ -639,6 +622,19 @@ func main() {
 		os.Exit(1)
 	}
 	reconcileCreateWatches(ctx.watchEntries)
+
+	for _, w := range wEntries {
+		if err := unlockWithFscrypt(w.Path); err != nil {
+			logMsg(syslog.LOG_ERR, "Failed to inject fscrypt key for %s: %v", w.Path, err)
+			os.Exit(1)
+		}
+	}
+
+	pidData := fmt.Sprintf("%d\n", os.Getpid())
+	os.WriteFile(PidFile, []byte(pidData), 0644)
+	defer os.Remove(PidFile)
+
+	applyChattr(ctx.watchEntries)
 
 	if notifySocket := os.Getenv("NOTIFY_SOCKET"); notifySocket != "" {
 		conn, err := net.Dial("unixgram", notifySocket)
@@ -675,30 +671,14 @@ func main() {
 			case syscall.SIGTERM, syscall.SIGINT:
 				logMsg(syslog.LOG_INFO, "Caught termination signal. Initiating secure lockdown...")
 
+				shuttingDown.Store(true)
+
 				ctx.RLock()
 				currentWatches := ctx.watchEntries
 				ctx.RUnlock()
 
-				// 1. Revert chattr BEFORE dropping fanotify.
-				// (Our new isAllowed bypass allows the daemon to do this safely).
 				revertChattr(currentWatches)
 
-				// 2. DESTROY the fscrypt keys BEFORE dropping fanotify!
-				for _, w := range currentWatches {
-					if err := lockWithFscrypt(w.Path); err != nil {
-						if strings.Contains(err.Error(), "some files using the key are still open") {
-							logMsg(syslog.LOG_INFO, "Key wiped for %s (Kernel VFS caches will safely drop in the background)", w.Path)
-						} else {
-							logMsg(syslog.LOG_ERR, "Failed to lock %s: %v", w.Path, err)
-						}
-					} else {
-						logMsg(syslog.LOG_INFO, "Locked fscrypt directory fully: %s", w.Path)
-					}
-				}
-
-				// 3. The master key is now gone from the kernel. Any process that slips
-				// in after we drop the watchers will be hit with a hard ENOKEY by the kernel itself.
-				// It is now physically safe to drop the guards.
 				createWatcher.Lock()
 				for wd := range createWatcher.wdToDir {
 					unix.InotifyRmWatch(createWatcher.fd, uint32(wd))
@@ -708,11 +688,30 @@ func main() {
 				}
 				createWatcher.Unlock()
 
-				// 4. Finally, flush and close fanotify
+				for _, w := range currentWatches {
+					locked := false
+					for i := 0; i < 100; i++ {
+						if err := lockWithFscrypt(w.Path); err != nil {
+							if strings.Contains(err.Error(), "some files using the key are still open") || strings.Contains(err.Error(), "in use") {
+								time.Sleep(10 * time.Millisecond)
+								continue
+							}
+							logMsg(syslog.LOG_ERR, "Failed to lock %s: %v", w.Path, err)
+							break
+						} else {
+							logMsg(syslog.LOG_INFO, "Locked fscrypt directory fully: %s", w.Path)
+							locked = true
+							break
+						}
+					}
+					if !locked {
+						logMsg(syslog.LOG_WARNING, "Could not fully lock %s (partially locked)", w.Path)
+					}
+				}
+
 				unix.FanotifyMark(fanFd, unix.FAN_MARK_FLUSH, 0, unix.AT_FDCWD, "")
 				unix.Close(fanFd)
 
-				// Yield briefly just to let the kernel's fput() task_queue clear out cleanly
 				time.Sleep(100 * time.Millisecond)
 
 				logMsg(syslog.LOG_INFO, "Shutdown complete. All vaults secure.")
