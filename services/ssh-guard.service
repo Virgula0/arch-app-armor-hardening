@@ -5,7 +5,8 @@ After=local-fs.target ssh-guard-init.service
 Before=sshd.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/local/sbin/ssh-guard
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

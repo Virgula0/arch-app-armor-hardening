@@ -2,21 +2,24 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/syslog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
 
+	"github.com/google/fscrypt/actions"
+	"github.com/google/fscrypt/crypto"
 	"golang.org/x/sys/unix"
 )
 
@@ -124,45 +127,46 @@ func getOrGenerateKey() ([]byte, error) {
 	return nil, err
 }
 
-func injectKey(mountPath string) error {
-	mountFd, err := unix.Open(mountPath, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+func unlockWithFscrypt(dirPath string) error {
+	fsctx, err := actions.NewContextFromPath(dirPath, nil) // nil = current user (root)
 	if err != nil {
-		return fmt.Errorf("open mount point %s: %w", mountPath, err)
-	}
-	defer unix.Close(mountFd)
-
-	key, err := getOrGenerateKey()
-	if err != nil {
-		return err
+		return fmt.Errorf("fscrypt context for %s: %w", dirPath, err)
 	}
 
+	policy, err := actions.GetPolicyFromPath(fsctx, dirPath)
+	if err != nil {
+		return fmt.Errorf("get policy for %s: %w", dirPath, err)
+	}
+
+	if policy.IsProvisionedByTargetUser() {
+		return nil // already unlocked (e.g. on SIGHUP reload)
+	}
+
+	keyBytes, err := os.ReadFile(MasterKeyFile)
+	if err != nil {
+		return fmt.Errorf("read master key: %w", err)
+	}
 	defer func() {
-		for i := range key {
-			key[i] = 0
+		for i := range keyBytes {
+			keyBytes[i] = 0
 		}
-		runtime.KeepAlive(key)
 	}()
 
-	var arg fscryptAddKeyArgFull
-	arg.Header.Key_spec.Type = unix.FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER
-	arg.Header.Raw_size = FscryptKeySize
-	copy(arg.Raw[:], key)
+	// There's exactly one raw_key protector on this policy — always pick it.
+	optionFn := func(_ string, _ []*actions.ProtectorOption) (int, error) {
+		return 0, nil
+	}
+	keyFn := func(_ actions.ProtectorInfo, _ bool) (*crypto.Key, error) {
+		return crypto.NewFixedLengthKeyFromReader(bytes.NewReader(keyBytes), FscryptKeySize)
+	}
 
-	defer func() {
-		for i := range arg.Raw {
-			arg.Raw[i] = 0
-		}
-		runtime.KeepAlive(&arg)
-	}()
+	if err := policy.Unlock(optionFn, keyFn); err != nil {
+		return fmt.Errorf("unlock policy for %s: %w", dirPath, err)
+	}
+	defer policy.Lock()
 
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(mountFd),
-		unix.FS_IOC_ADD_ENCRYPTION_KEY,
-		uintptr(unsafe.Pointer(&arg)),
-	)
-	if errno != 0 {
-		return fmt.Errorf("FS_IOC_ADD_ENCRYPTION_KEY failed: %w", errno)
+	if err := policy.Provision(); err != nil {
+		return fmt.Errorf("provision policy for %s: %w", dirPath, err)
 	}
 	return nil
 }
@@ -440,7 +444,7 @@ func main() {
 
 	// Inject the master key into the kernel for every watched directory
 	for _, w := range wEntries {
-		if err := injectKey(w.Path); err != nil {
+		if err := unlockWithFscrypt(w.Path); err != nil {
 			logMsg(syslog.LOG_ERR, "Failed to inject fscrypt key for %s: %v", w.Path, err)
 			os.Exit(1)
 		}
@@ -461,6 +465,16 @@ func main() {
 	defer unix.Close(fanFd)
 
 	addAllMarks(fanFd, ctx.watchEntries)
+
+	// Signal systemd that we are ready (keys injected, marks active)
+	if notifySocket := os.Getenv("NOTIFY_SOCKET"); notifySocket != "" {
+		conn, err := net.Dial("unixgram", notifySocket)
+		if err == nil {
+			conn.Write([]byte("READY=1"))
+			conn.Close()
+		}
+	}
+
 	logMsg(syslog.LOG_INFO, "Daemon functional framework active. All directories encrypted and hardened.")
 
 	sigChan := make(chan os.Signal, 2)

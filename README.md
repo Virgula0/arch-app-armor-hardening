@@ -256,4 +256,4 @@ At this point, `ssh -T git@github.com` should work and `ssh-add -l` should show 
 
 ### Notes
 
-Scripts have been generated using `gemini` and `deepseek`
+Scripts have been generated using `gemini`, `deepseek`, `claude`
