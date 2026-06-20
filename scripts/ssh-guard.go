@@ -179,7 +179,7 @@ func unlockWithFscrypt(dirPath string) error {
 	return nil
 }
 
-func lockWithFscrypt(dirPath string) error {
+func lockWithFscrypt(dirPath string, forceFlush bool) error {
 	fsctx, err := actions.NewContextFromPath(dirPath, nil)
 	if err != nil {
 		return fmt.Errorf("fscrypt context for %s: %w", dirPath, err)
@@ -188,9 +188,11 @@ func lockWithFscrypt(dirPath string) error {
 	if err != nil {
 		return fmt.Errorf("get policy for %s: %w", dirPath, err)
 	}
-	if !policy.IsProvisionedByTargetUser() {
+
+	if !forceFlush && !policy.IsProvisionedByTargetUser() {
 		return nil
 	}
+
 	if err := policy.Deprovision(true); err != nil {
 		return fmt.Errorf("deprovision policy for %s: %w", dirPath, err)
 	}
@@ -745,7 +747,11 @@ func main() {
 				}
 				createWatcher.Unlock()
 
-				// ★ Remove fanotify marks BEFORE locking fscrypt
+				for _, w := range currentWatches {
+					_ = lockWithFscrypt(w.Path, false)
+				}
+
+				// ★ Remove fanotify marks BEFORE final fscrypt lock
 				mask := uint64(unix.FAN_OPEN_PERM | unix.FAN_ACCESS_PERM | unix.FAN_EVENT_ON_CHILD)
 				for _, w := range currentWatches {
 					unix.FanotifyMark(fanFd, unix.FAN_MARK_REMOVE, mask, unix.AT_FDCWD, w.Path)
@@ -754,19 +760,29 @@ func main() {
 				unix.FanotifyMark(fanFd, unix.FAN_MARK_FLUSH, 0, unix.AT_FDCWD, "")
 				unix.Close(fanFd)
 
-				// Now no references to the encrypted directories remain → key removal can succeed
+				// ★ Second-pass lock: Force flush the now-unpinned inodes
 				for _, w := range currentWatches {
 					locked := false
 					for i := 0; i < 100; i++ {
-						if err := lockWithFscrypt(w.Path); err != nil {
-							if strings.Contains(err.Error(), "some files using the key are still open") ||
-								strings.Contains(err.Error(), "in use") {
+						if err := lockWithFscrypt(w.Path, true); err != nil {
+							errStr := err.Error()
+							// EBUSY: Inodes are still cached/busy. Wait and retry.
+							if strings.Contains(errStr, "some files using the key are still open") ||
+								strings.Contains(errStr, "in use") {
 								time.Sleep(10 * time.Millisecond)
 								continue
+							}
+							// ENOKEY: Kernel confirms the key is gone and NO inodes are using it.
+							if strings.Contains(errStr, "Required key not available") ||
+								strings.Contains(errStr, "key not present") {
+								logMsg(syslog.LOG_INFO, "Locked fscrypt directory fully: %s", w.Path)
+								locked = true
+								break
 							}
 							logMsg(syslog.LOG_ERR, "Failed to lock %s: %v", w.Path, err)
 							break
 						} else {
+							// Returned nil directly
 							logMsg(syslog.LOG_INFO, "Locked fscrypt directory fully: %s", w.Path)
 							locked = true
 							break

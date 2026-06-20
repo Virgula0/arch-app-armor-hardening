@@ -116,7 +116,7 @@ sudo aa-enforce /usr/bin/ssh /usr/bin/git
 ```bash
 cd scripts
 go mod download && go mod verify && go mod tidy
-sudo go build -ldflags="-s -w" -race -o /usr/local/sbin/ssh-guard ssh-guard.go
+sudo go build -ldflags="-s -w" -o /usr/local/sbin/ssh-guard ssh-guard.go
 cd ..
 
 sudo chmod 700 /usr/local/sbin/ssh-guard
