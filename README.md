@@ -1,5 +1,7 @@
 # SSH-Guard: Arch Linux Supply Chain System Hardening Guide
 
+# Archived, please refer to a more stable and better rewrite at: https://github.com/Virgula0/app-listener. The new rewrite does not require apparmor at all.
+
 > [!NOTE]
 > WIP attempt, be careful.
 
